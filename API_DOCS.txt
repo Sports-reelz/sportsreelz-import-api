@@ -1,0 +1,189 @@
+SPORTSREELZ Video Import API — Integration Guide
+===================================================
+
+STATUS: Complete and ready for real data.
+DOCS:   http://your-server:8000/docs (interactive Swagger UI)
+
+
+QUICK SETUP
+-----------
+1. Unzip SPORTSREELZ_Sprint1_Delivery.zip
+2. Copy .env.example to .env and fill in:
+   - API_KEY=your-secure-key
+   - AWS_ACCESS_KEY_ID=...
+   - AWS_SECRET_ACCESS_KEY=...
+   - AWS_REGION=us-east-1
+3. Run:  docker-compose up -d
+4. API is live at http://your-server:8000
+
+Alternative (no Docker):
+   pip install -r requirements.txt
+   uvicorn api_service:app --host 0.0.0.0 --port 8000
+
+
+AUTHENTICATION
+--------------
+All /api/* endpoints (except /api/health) require:
+   Header: X-API-Key: your-api-key
+
+
+ENDPOINTS
+=========
+
+1. POST /api/import — Start a video import job
+-----------------------------------------------
+Request:
+{
+  "user_id": "player_123",
+  "video_url": "https://www.hudl.com/video/3/15987654/62e3a6b0",
+  "platform": "hudl",
+  "platform_email": "player@email.com",
+  "platform_password": "playerpass123",
+  "quality": "1080p"
+}
+
+Fields:
+  user_id          (required)  SPORTSREELZ player/user ID
+  video_url        (required)  Game URL from HUDL, VEO, or Trace
+  platform         (optional)  Auto-detected from URL if omitted
+  platform_email   (optional)  Required for HUDL login and Trace magic code
+  platform_password(optional)  Required for HUDL login
+  quality          (optional)  "1080p" (default), "720p", "best"
+
+Response (200):
+{
+  "job_id": "a1b2c3d4",
+  "status": "queued",
+  "message": "Download started"
+}
+
+For Trace, response will be:
+{
+  "job_id": "a1b2c3d4",
+  "status": "pending_verification",
+  "message": "Magic code sent to player@email.com. Submit code via POST /api/import/verify"
+}
+
+
+2. GET /api/import/status/{job_id} — Poll job progress
+-------------------------------------------------------
+Poll every 2-5 seconds until status is "done" or "error".
+
+Response (200):
+{
+  "job_id": "a1b2c3d4",
+  "status": "downloading",
+  "platform": "hudl",
+  "title": "Game vs Rival - Apr 10, 2026",
+  "percent": 45.2,
+  "speed": "2.3 MB/s",
+  "error": null,
+  "download_url": null,
+  "created_at": 1713100000.0,
+  "updated_at": 1713100045.0
+}
+
+Status flow:
+  queued -> extracting -> downloading -> processing -> uploading -> done
+                                                                 -> error
+
+When status = "done":
+  - percent = 100.0
+  - download_url = S3 URL (if SPORTSREELZ_UPLOAD_URL is configured)
+
+When status = "error":
+  - error = human-readable error message
+
+
+3. POST /api/import/verify — Submit Trace magic code
+-----------------------------------------------------
+Only needed when POST /api/import returns status "pending_verification".
+The player receives a 6-digit code via email from Trace.
+
+Request:
+{
+  "job_id": "a1b2c3d4",
+  "magic_code": "482916"
+}
+
+Response (200):
+{
+  "job_id": "a1b2c3d4",
+  "status": "queued",
+  "message": "Verification successful, download started"
+}
+
+After this, poll GET /api/import/status/{job_id} as normal.
+
+
+4. GET /api/health — Health check
+----------------------------------
+No authentication required.
+
+Response (200):
+{
+  "status": "ok",
+  "active_jobs": 2,
+  "total_jobs": 15
+}
+
+
+SUPPORTED PLATFORMS
+===================
+Platform    URL Domains                     Auth Required
+--------    -----------                     -------------
+HUDL        hudl.com, app.hudl.com          Email + password
+VEO         app.veo.co                      None (public) or bearer token
+Trace       traceup.com, tracevision.com    Email + magic code (2-step)
+YouTube     youtube.com, youtu.be           None (public)
+Pixellot    pixellot.tv                     None
+
+
+S3 UPLOAD PATTERN
+=================
+Videos are uploaded to S3 as:
+  {gameId}/file-{unix_timestamp_ms}-{original_filename}
+
+Buckets:
+  Staging:    sportsreelz-input / sportsreelz-output
+  Production: sreelz-input / sreelz-output
+
+
+INTEGRATION FLOW (for your frontend)
+=====================================
+
+Standard (HUDL/VEO):
+  1. Player pastes game URL in SPORTSREELZ UI
+  2. Frontend calls POST /api/import with URL + credentials
+  3. Frontend polls GET /api/import/status/{job_id} every 3 seconds
+  4. Show progress bar using "percent" and "speed" fields
+  5. When status = "done", link video to player profile
+
+Trace (2-step auth):
+  1. Player pastes Trace game URL
+  2. Frontend calls POST /api/import with URL + email
+  3. API returns status = "pending_verification"
+  4. Frontend shows "Enter the 6-digit code sent to your email"
+  5. Player enters code, frontend calls POST /api/import/verify
+  6. API returns status = "queued", download begins
+  7. Poll GET /api/import/status/{job_id} as normal
+
+
+ERROR HANDLING
+==============
+HTTP 400 — Bad request (unknown platform, missing required fields)
+HTTP 401 — Invalid or missing API key
+HTTP 404 — Job ID not found
+
+All errors include an "error" field with a human-readable message.
+
+
+NOTES
+=====
+- The /docs endpoint provides full interactive Swagger documentation
+  where your team can test API calls directly in the browser.
+- Trace sessions are cached for 30 days — players won't need to
+  re-enter the magic code every time.
+- Video normalization (1080p, 16:9) is enabled by default.
+  Set NORMALIZE_VIDEO=false in .env to disable.
+- Max 3 concurrent downloads by default. Adjust MAX_WORKERS in .env.

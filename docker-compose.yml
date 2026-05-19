@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  importer:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - API_KEY=${API_KEY:-changeme}
+      - SPORTSREELZ_UPLOAD_URL=${SPORTSREELZ_UPLOAD_URL:-}
+      - MAX_WORKERS=${MAX_WORKERS:-3}
+      - NORMALIZE_VIDEO=${NORMALIZE_VIDEO:-true}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+    volumes:
+      - downloads:/app/downloads
+    restart: unless-stopped
+
+volumes:
+  downloads:
