@@ -26,9 +26,24 @@ jobs:
         run: |
           docker build -t 000009587073.dkr.ecr.ap-south-1.amazonaws.com/sportsreelz-import-api:staging .
 
-  push:
+  sonarqube:
     runs-on: ubuntu-latest
     needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  push:
+    runs-on: ubuntu-latest
+    needs: sonarqube
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
