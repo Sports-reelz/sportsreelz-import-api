@@ -55,11 +55,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install cyclonedx-bom
+          pip install cyclonedx-bom pip-audit
+          pip install -r requirements.txt
 
       - name: Generate SBOM
         run: |
-          cyclonedx-py requirements requirements.txt -o sbom.json --format json
+          cyclonedx-py environment -o sbom.json
 
       - name: Upload SBOM to Dependency-Track
         run: |
