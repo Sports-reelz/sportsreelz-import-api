@@ -75,7 +75,10 @@ class HudlExtractor(BaseExtractor):
             return "fan_page"
         if "vcloud" in host and "/broadcast/" in parsed.path:
             return "vcloud_embed"
-        if "app.hudl.com" in host and ("/watch" in parsed.path or "/video" in parsed.path):
+        # app.hudl.com/watch and www.hudl.com/video are both authenticated URLs
+        # that require login credentials. Treat them the same.
+        auth_hosts = ("app.hudl.com", "www.hudl.com", "hudl.com")
+        if host in auth_hosts and re.search(r'/(watch|video)/', parsed.path):
             return "app_hudl"
         if "hudl.com" in host:
             return "hudl_page"
@@ -270,12 +273,9 @@ class HudlExtractor(BaseExtractor):
         if not cookies and not session_token:
             raise AuthRequiredError(
                 "HUDL",
-                "app.hudl.com requires login cookies.\n"
-                "How to get cookies.txt (one-time setup):\n"
-                "  1. Install 'Get cookies.txt LOCALLY' Chrome extension\n"
-                "  2. Log into app.hudl.com in Chrome\n"
-                "  3. Click the extension -> Export -> save as hudl_cookies.txt\n"
-                "  4. Use: --cookies hudl_cookies.txt"
+                "HUDL requires login credentials for this URL. "
+                "Provide platform_email and platform_password in the "
+                "/api/import request payload."
             )
 
         import urllib.parse as _up

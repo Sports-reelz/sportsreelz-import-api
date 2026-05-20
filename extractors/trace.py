@@ -85,10 +85,21 @@ class TraceAuthManager:
     def request_magic_code(self, email: str) -> bool:
         """
         Trigger Trace to send a magic code to the given email.
-        Returns True if the request was accepted.
+
+        Tries the Playwright browser flow first because it submits the email
+        through Trace's actual sign-in form, which is the only path that
+        reliably triggers Trace's email send pipeline. Direct REST endpoints
+        are retained as a fallback but commonly return 200 OK without firing
+        the email send.
+
+        Returns True if the request was accepted by some path.
         """
-        # Trace uses a magic link login — POST email to their auth endpoint
-        # The endpoint sends a 6-digit code to the email
+        # Primary: load the real Trace sign-in form and submit the email
+        if self._trigger_magic_code_via_browser(email):
+            return True
+
+        # Fallback: direct REST endpoints (kept for environments where
+        # Playwright is unavailable or the browser flow times out)
         try:
             resp = requests.post(
                 f"{TRACE_BASE}/api/auth/magic-code",
@@ -99,7 +110,6 @@ class TraceAuthManager:
             if resp.status_code in (200, 201, 204):
                 return True
 
-            # Try alternative endpoint patterns
             for endpoint in [
                 f"{TRACE_BASE}/api/auth/login",
                 f"{TRACE_BASE}/api/auth/send-code",
@@ -118,6 +128,72 @@ class TraceAuthManager:
             raise ExtractionError(f"Failed to request Trace magic code: {e}")
 
         return False
+
+    def _trigger_magic_code_via_browser(self, email: str) -> bool:
+        """
+        Open Trace's sign-in page in a headless browser, type the email into
+        the form, and click submit. This drives Trace's UI down its own
+        email-send path so the magic code goes out the same way a real user
+        sign-in would trigger it.
+
+        Returns True on successful form submission, False otherwise.
+        """
+        try:
+            from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+        except ImportError:
+            return False
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                    ],
+                )
+                context = browser.new_context(
+                    user_agent=_UA,
+                    viewport={"width": 1280, "height": 800},
+                )
+                context.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+                )
+                page = context.new_page()
+
+                try:
+                    page.goto(
+                        f"{TRACE_BASE}/#/",
+                        wait_until="domcontentloaded",
+                        timeout=20000,
+                    )
+
+                    email_input = page.wait_for_selector(
+                        'input[type="email"], input[name="email"], '
+                        'input[placeholder*="email" i]',
+                        timeout=10000,
+                    )
+                    email_input.fill(email)
+
+                    submit = page.locator(
+                        'button:has-text("Sign In"), button:has-text("Continue"), '
+                        'button:has-text("Send"), button[type="submit"]'
+                    ).first
+                    submit.click()
+
+                    # Give Trace's backend a moment to register the request
+                    # and fire the send-email job before we close the browser.
+                    time.sleep(3)
+                    browser.close()
+                    return True
+                except PWTimeout:
+                    browser.close()
+                    return False
+                except Exception:
+                    browser.close()
+                    return False
+        except Exception:
+            return False
 
     def submit_magic_code(self, email: str, code: str) -> dict:
         """
