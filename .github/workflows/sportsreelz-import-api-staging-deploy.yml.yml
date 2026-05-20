@@ -1,0 +1,28 @@
+name: Sportsreelz Import API - Staging Deploy
+
+on:
+  push:
+    branches:
+      - import-api-stage
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Deploy via SSM
+        run: |
+          aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID_STAGING }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["cd /opt/sportsreelz-import-api && git pull origin import-api-stage && docker-compose down && docker-compose up -d --build && sleep 10 && curl -f http://localhost:8000/api/health"]' \
+            --timeout-seconds 600 \
+            --comment "Deploy sportsreelz-import-api to staging" \
+            --output text
