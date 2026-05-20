@@ -41,9 +41,37 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
-  push:
+  dependency-track:
     runs-on: ubuntu-latest
     needs: sonarqube
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install cyclonedx-bom
+
+      - name: Generate SBOM
+        run: |
+          cyclonedx-py requirements requirements.txt --output-format json --outfile sbom.json
+
+      - name: Upload SBOM to Dependency-Track
+        run: |
+          curl -X POST "${{ secrets.DEPENDENCY_TRACK_URL }}/api/v1/bom" \
+            -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
+            -H "Content-Type: multipart/form-data" \
+            -F "project=${{ secrets.DEPENDENCY_TRACK_PROJECT_UUID }}" \
+            -F "bom=@sbom.json"
+
+  push:
+    runs-on: ubuntu-latest
+    needs: dependency-track
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
