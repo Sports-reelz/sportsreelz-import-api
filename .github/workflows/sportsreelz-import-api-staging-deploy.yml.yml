@@ -71,11 +71,11 @@ jobs:
 
       - name: Upload SBOM to Dependency-Track
         run: |
+          BOM_CONTENT=$(base64 -w 0 sbom.json)
           RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X PUT "${{ secrets.DEPENDENCY_TRACK_URL }}/api/v1/bom" \
             -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
-            -H "Content-Type: multipart/form-data" \
-            -F "project=${{ secrets.DEPENDENCY_TRACK_PROJECT_UUID }}" \
-            -F "bom=@sbom.json")
+            -H "Content-Type: application/json" \
+            -d "{\"project\": \"${{ secrets.DEPENDENCY_TRACK_PROJECT_UUID }}\", \"bom\": \"$BOM_CONTENT\"}")
           echo "$RESPONSE"
 
   push:
