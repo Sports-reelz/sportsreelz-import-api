@@ -20,7 +20,7 @@ import requests
 from urllib.parse import urlparse
 from pathlib import Path
 
-from .base import BaseExtractor, ExtractResult, ExtractionError, AuthRequiredError
+from .base import BaseExtractor, ExtractResult, ExtractionError, AuthRequiredError, run_playwright_sync
 
 
 # ── Trace Auth Manager ────────────────────────────────────────────────────────
@@ -137,7 +137,17 @@ class TraceAuthManager:
         sign-in would trigger it.
 
         Returns True on successful form submission, False otherwise.
+
+        The Playwright sync API cannot run inside an asyncio event loop
+        (FastAPI's handler context), so the actual browser work is dispatched
+        to a fresh worker thread via run_playwright_sync.
         """
+        try:
+            return run_playwright_sync(self._trigger_magic_code_via_browser_sync, email, timeout=60)
+        except Exception:
+            return False
+
+    def _trigger_magic_code_via_browser_sync(self, email: str) -> bool:
         try:
             from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
         except ImportError:
@@ -245,7 +255,13 @@ class TraceAuthManager:
         """
         Fallback: use Playwright to complete the magic code login.
         This captures the actual session cookies from the browser.
+
+        Dispatched to a fresh worker thread via run_playwright_sync because
+        the sync Playwright API cannot run inside an asyncio event loop.
         """
+        return run_playwright_sync(self._login_with_browser_sync, email, code, timeout=120)
+
+    def _login_with_browser_sync(self, email: str, code: str) -> dict:
         try:
             from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
         except ImportError:
@@ -558,7 +574,13 @@ class TraceExtractor(BaseExtractor):
         """
         Load the Trace page in a headless browser and intercept API calls
         to capture the actual teamId and gameId.
+
+        Dispatched to a fresh worker thread via run_playwright_sync because
+        the sync Playwright API cannot run inside an asyncio event loop.
         """
+        return run_playwright_sync(self._resolve_via_browser_sync, url, headers, timeout=60)
+
+    def _resolve_via_browser_sync(self, url: str, headers: dict) -> tuple:
         from playwright.sync_api import sync_playwright
 
         captured = {"team_id": None, "game_id": None}

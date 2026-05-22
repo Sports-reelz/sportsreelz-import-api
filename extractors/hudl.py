@@ -14,7 +14,7 @@ import base64
 import requests
 from urllib.parse import urlparse, parse_qs, urljoin, unquote
 
-from .base import BaseExtractor, ExtractResult, ExtractionError, AuthRequiredError
+from .base import BaseExtractor, ExtractResult, ExtractionError, AuthRequiredError, run_playwright_sync
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -410,7 +410,14 @@ class HudlExtractor(BaseExtractor):
         Fallback: load the HUDL page in a headless browser with session cookies,
         intercept the .m3u8 network request the video player fires automatically.
         Works regardless of GraphQL schema changes.
+
+        Dispatched to a fresh worker thread via run_playwright_sync because the
+        sync Playwright API cannot run inside an asyncio event loop.
         """
+        return run_playwright_sync(self._extract_app_hudl_playwright_sync, url, cookies, headers, timeout=60)
+
+    def _extract_app_hudl_playwright_sync(self, url: str, cookies,
+                                           headers: dict) -> ExtractResult:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
         import time as _time
 

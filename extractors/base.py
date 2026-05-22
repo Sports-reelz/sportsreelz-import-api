@@ -104,3 +104,39 @@ def detect_platform(url: str) -> str:
     if "pixellot.tv" in host or "pixellot.co" in host:
         return "pixellot"
     return "unknown"
+
+
+def run_playwright_sync(fn, *args, timeout: float = 120, **kwargs):
+    """
+    Run a function that uses Playwright's sync API in a fresh worker thread
+    so it cannot be invoked from inside a running asyncio event loop.
+
+    Playwright's sync API raises
+        "Playwright Sync API inside the asyncio loop. Please use the Async API instead."
+    when called from any thread that has a running asyncio event loop. FastAPI
+    handlers run in such a context. Wrapping the sync call in a fresh thread
+    isolates it from any caller-side event loop.
+
+    Re-raises whatever exception the wrapped function raised.
+    """
+    import threading
+
+    result_holder = {"value": None, "exc": None}
+
+    def _runner():
+        try:
+            result_holder["value"] = fn(*args, **kwargs)
+        except BaseException as e:  # noqa: BLE001 — re-raised on the calling thread
+            result_holder["exc"] = e
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        raise ExtractionError(
+            f"Playwright operation timed out after {timeout}s."
+        )
+    if result_holder["exc"] is not None:
+        raise result_holder["exc"]
+    return result_holder["value"]

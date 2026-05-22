@@ -138,7 +138,18 @@ def login_with_browser(email: str, password: str, on_status=None) -> bool:
 
 def _do_browser_login(email: str, password: str, headless: bool,
                       on_status=None):
-    """Inner login — runs Playwright with given headless setting."""
+    """Inner login — runs Playwright with given headless setting.
+
+    Dispatched to a fresh worker thread via run_playwright_sync because the
+    sync Playwright API cannot run inside an asyncio event loop (FastAPI's
+    handler context).
+    """
+    from extractors.base import run_playwright_sync
+    return run_playwright_sync(_do_browser_login_sync, email, password, headless, on_status, timeout=120)
+
+
+def _do_browser_login_sync(email: str, password: str, headless: bool,
+                           on_status=None):
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
     # Anti-detection args for headless mode
