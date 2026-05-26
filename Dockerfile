@@ -5,6 +5,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# Verify FFmpeg installation
+RUN ffmpeg -version
+
 WORKDIR /app
 
 # Install Python dependencies
