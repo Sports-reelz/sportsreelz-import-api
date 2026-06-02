@@ -107,8 +107,24 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
         "--newline",   # Progress on new lines for easier parsing
     ]
 
-    if cookies_path:
-        cmd += ["--cookies", cookies_path]
+    # Cookie handling. YouTube has been rolling out aggressive bot-detection
+    # (the "Sign in to confirm you're not a bot" error). Pass a cookies file
+    # from a signed-in browser to bypass it.
+    #
+    # Priority:
+    #   1. cookies_path passed in by the caller (per-request)
+    #   2. YT_DLP_COOKIES_FILE env var (applies to all yt-dlp downloads)
+    #   3. YOUTUBE_COOKIES_FILE env var (legacy name, same behavior)
+    #   4. YT_DLP_COOKIES_FROM_BROWSER env var (e.g. "chrome", "firefox") —
+    #      uses Playwright/yt-dlp browser-cookie extraction on the host
+    effective_cookies = cookies_path or os.environ.get("YT_DLP_COOKIES_FILE") \
+        or os.environ.get("YOUTUBE_COOKIES_FILE")
+    if effective_cookies and os.path.isfile(effective_cookies):
+        cmd += ["--cookies", effective_cookies]
+
+    cookies_from_browser = os.environ.get("YT_DLP_COOKIES_FROM_BROWSER")
+    if cookies_from_browser and not effective_cookies:
+        cmd += ["--cookies-from-browser", cookies_from_browser]
 
     # Add source-specific headers
     for k, v in (result.headers or {}).items():

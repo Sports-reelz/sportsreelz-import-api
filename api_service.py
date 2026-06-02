@@ -68,7 +68,6 @@ app = FastAPI(
 )
 
 # ── OpenAPI (Swagger) API-key auth ─────────────────────────────────────────────
-
 def custom_openapi():
     """
     Add `X-API-Key` auth to the Swagger UI via an OpenAPI security scheme.
@@ -470,7 +469,12 @@ def _process_job(job_id: str, cookies: dict = None, session_token: str = None):
         else:
             log.warning(f"[{job_id}] Normalization failed, using original")
 
-    # ── Upload (S3 direct, or SPORTSREELZ webhook) ────────────────────
+    # ── Upload: S3 first (file landing), then SPORTSREELZ webhook ─────
+    # When both are configured, the file lands in S3 and the resulting S3
+    # URL is then posted to SPORTSREELZ_UPLOAD_URL as a URL-pointer so the
+    # downstream transcoder (MediaConvert) can fetch it. When only one is
+    # configured, only that path fires.
+    s3_url = None
     if S3_BUCKET:
         job["status"] = "uploading"
         job["percent"] = 0.0
@@ -502,42 +506,80 @@ def _process_job(job_id: str, cookies: dict = None, session_token: str = None):
             log.warning(f"[{job_id}] S3 upload failed: {e} (video still saved locally)")
             job["error"] = f"S3 upload failed: {e}"
 
-    elif SPORTSREELZ_UPLOAD_URL:
+    if SPORTSREELZ_UPLOAD_URL:
         job["status"] = "uploading"
-        job["percent"] = 0.0
         job["updated_at"] = time.time()
-        log.info(f"[{job_id}] Uploading to SPORTSREELZ webhook...")
+        log.info(f"[{job_id}] Notifying SPORTSREELZ webhook...")
 
         try:
             import requests as req
-            with open(output_path, "rb") as f:
-                files = {"video": (filename, f, "video/mp4")}
-                data = {
-                    "userID": job["user_id"],
-                    "title": result.title,
-                    "platform": result.platform,
-                }
-                if result.duration:
-                    data["duration"] = str(int(result.duration))
 
+            payload = {
+                "videoUrl": s3_url,
+                "userID": job["user_id"],
+                "title": result.title,
+                "platform": result.platform,
+            }
+            if result.duration:
+                payload["duration"] = int(result.duration)
+
+            if s3_url:
+                # File is already in S3 — post URL pointer as JSON so the
+                # transcode-from-url endpoint can pull it.
                 resp = req.post(
                     SPORTSREELZ_UPLOAD_URL,
-                    files=files,
-                    data=data,
-                    headers={"X-API-Key": API_KEY},
-                    timeout=600,  # 10 min for large uploads
+                    json=payload,
+                    headers={
+                        "X-API-Key": API_KEY,
+                        "Content-Type": "application/json",
+                    },
+                    timeout=60,
+                )
+            else:
+                # No S3 upload happened — fall back to multipart file upload
+                # for backward compatibility with deployments that don't use
+                # S3 at all.
+                with open(output_path, "rb") as f:
+                    files = {"video": (filename, f, "video/mp4")}
+                    data = {
+                        "userID": str(job["user_id"]),
+                        "title": result.title,
+                        "platform": result.platform,
+                    }
+                    if result.duration:
+                        data["duration"] = str(int(result.duration))
+                    resp = req.post(
+                        SPORTSREELZ_UPLOAD_URL,
+                        files=files,
+                        data=data,
+                        headers={"X-API-Key": API_KEY},
+                        timeout=600,
+                    )
+
+            if resp.status_code in (200, 201):
+                body = {}
+                try:
+                    body = resp.json() if resp.text else {}
+                except Exception:
+                    body = {}
+                game_id = body.get("gameId") or body.get("game_id") or "unknown"
+                webhook_url = body.get("url") or body.get("videoUrl") or body.get("download_url")
+                log.info(
+                    f"[{job_id}] Webhook accepted "
+                    f"(success={body.get('success')}, gameId={game_id})"
+                )
+                # Webhook response URL takes precedence over the S3 URL if
+                # the transcoder returns its own canonical URL.
+                if webhook_url:
+                    job["download_url"] = webhook_url
+            else:
+                log.warning(
+                    f"[{job_id}] Webhook returned {resp.status_code}: "
+                    f"{resp.text[:200]}"
                 )
 
-                if resp.status_code in (200, 201):
-                    body = resp.json() if resp.text else {}
-                    game_id = body.get("gameId", "unknown")
-                    log.info(f"[{job_id}] Uploaded! gameId={game_id}")
-                    job["download_url"] = body.get("url", "")
-                else:
-                    log.warning(f"[{job_id}] Upload returned {resp.status_code}: {resp.text[:200]}")
-
         except Exception as e:
-            log.warning(f"[{job_id}] Upload failed: {e} (video still saved locally)")
+            log.warning(f"[{job_id}] Webhook notification failed: {e}")
 
     # ── Done ──────────────────────────────────────────────────────────
     job["status"] = "done"

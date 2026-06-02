@@ -101,7 +101,7 @@ def detect_platform(url: str) -> str:
         return "youtube"
     if "traceup.com" in host or "tracevision.com" in host:
         return "trace"
-    if "pixellot.tv" in host or "pixellot.co" in host:
+    if "pixellot.tv" in host or "pixellot.co" in host or "pixellot.link" in host:
         return "pixellot"
     return "unknown"
 

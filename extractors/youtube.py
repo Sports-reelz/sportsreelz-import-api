@@ -42,10 +42,23 @@ class YouTubeExtractor(BaseExtractor):
             "--no-playlist",        # Single video only
         ]
 
-        # Add cookies if provided (path to cookies.txt or dict)
+        # Cookie handling. YouTube has been rolling out aggressive bot-detection
+        # ("Sign in to confirm you're not a bot"). Pass a cookies file from a
+        # signed-in browser to bypass it. Priority: explicit cookies arg, then
+        # YT_DLP_COOKIES_FILE env var, then YOUTUBE_COOKIES_FILE (legacy).
+        import os as _os
+        effective_cookies = None
         if isinstance(cookies, str):
-            # Treated as path to Netscape cookies file
-            cmd += ["--cookies", cookies]
+            effective_cookies = cookies
+        else:
+            effective_cookies = (_os.environ.get("YT_DLP_COOKIES_FILE")
+                                 or _os.environ.get("YOUTUBE_COOKIES_FILE"))
+        if effective_cookies and _os.path.isfile(effective_cookies):
+            cmd += ["--cookies", effective_cookies]
+
+        cookies_from_browser = _os.environ.get("YT_DLP_COOKIES_FROM_BROWSER")
+        if cookies_from_browser and not (effective_cookies and _os.path.isfile(effective_cookies)):
+            cmd += ["--cookies-from-browser", cookies_from_browser]
 
         cmd.append(url)
 
