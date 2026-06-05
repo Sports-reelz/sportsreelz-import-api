@@ -104,6 +104,7 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
         "--merge-output-format", "mp4",
         "-o", output_path,
         "--no-playlist",
+        "--remote-components", "ejs:github",
         "--newline",   # Progress on new lines for easier parsing
     ]
 

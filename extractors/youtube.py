@@ -40,6 +40,7 @@ class YouTubeExtractor(BaseExtractor):
             "--skip-download",
             "-j",                   # JSON output
             "--no-playlist",        # Single video only
+            "--remote-components", "ejs:github",
         ]
 
         # Cookie handling. YouTube has been rolling out aggressive bot-detection
