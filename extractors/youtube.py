@@ -40,7 +40,6 @@ class YouTubeExtractor(BaseExtractor):
             "--skip-download",
             "-j",                   # JSON output
             "--no-playlist",        # Single video only
-            "--remote-components", "ejs:github",
         ]
 
         # Cookie handling. YouTube has been rolling out aggressive bot-detection
@@ -56,6 +55,9 @@ class YouTubeExtractor(BaseExtractor):
                                  or _os.environ.get("YOUTUBE_COOKIES_FILE"))
         if effective_cookies and _os.path.isfile(effective_cookies):
             cmd += ["--cookies", effective_cookies]
+            # Helpful for server logs when debugging bot errors
+            import logging as _logging
+            _logging.getLogger("youtube_extractor").info("Using cookies file for yt-dlp: %s", effective_cookies)
 
         cookies_from_browser = _os.environ.get("YT_DLP_COOKIES_FROM_BROWSER")
         if cookies_from_browser and not (effective_cookies and _os.path.isfile(effective_cookies)):
