@@ -121,12 +121,10 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
         or os.environ.get("YOUTUBE_COOKIES_FILE")
     if effective_cookies and os.path.isfile(effective_cookies):
         cmd += ["--cookies", effective_cookies]
-        # Visible in container logs when a YouTube download actually receives cookies
-        import logging as _logging
-        _logging.getLogger("multi_dl").info("Passing --cookies to yt-dlp: %s", effective_cookies)
-        # Visible in container logs when a YouTube download actually receives cookies
-        import logging as _logging
-          cmd += ["--cookies-from-browser", cookies_from_browser]
+
+    cookies_from_browser = os.environ.get("YT_DLP_COOKIES_FROM_BROWSER")
+    if cookies_from_browser and not effective_cookies:
+        cmd += ["--cookies-from-browser", cookies_from_browser]
 
     # Add source-specific headers
     for k, v in (result.headers or {}).items():

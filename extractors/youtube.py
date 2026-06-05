@@ -55,10 +55,8 @@ class YouTubeExtractor(BaseExtractor):
                                  or _os.environ.get("YOUTUBE_COOKIES_FILE"))
         if effective_cookies and _os.path.isfile(effective_cookies):
             cmd += ["--cookies", effective_cookies]
-            # Helpful for server logs when debugging bot errors
-            import logging as _logging
-            _logging.getLogger("youtube_extractor").info("Using cookies file for yt-dlp: %s", effective_cookies)
-            # Helpful for server logs when debugging bot IES_FROM_BROWSER")
+
+        cookies_from_browser = _os.environ.get("YT_DLP_COOKIES_FROM_BROWSER")
         if cookies_from_browser and not (effective_cookies and _os.path.isfile(effective_cookies)):
             cmd += ["--cookies-from-browser", cookies_from_browser]
 
