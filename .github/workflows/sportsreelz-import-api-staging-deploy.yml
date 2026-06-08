@@ -133,3 +133,75 @@ jobs:
             --instance-id "${{ secrets.EC2_INSTANCE_ID_STAGING }}" \
             --query "[Status, StandardOutputContent, StandardErrorContent]" \
             --output text
+
+  dast-scan:
+    needs: deploy
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Wait for application to be ready
+      run: sleep 60
+
+    - name: DAST - OWASP ZAP Baseline Scan
+      run: |
+        echo "Starting OWASP ZAP DAST scan..."
+        echo "Testing connectivity to ${{ secrets.SPORTSREELZ_IMPORT_STAGING_URL }}"
+        curl -sI ${{ secrets.SPORTSREELZ_IMPORT_STAGING_URL }} || echo "Target not reachable"
+        
+        TEMP_DIR=$(mktemp -d)
+        chmod 777 $TEMP_DIR
+        mkdir -p dast-reports
+        
+        docker run --rm \
+          -v $TEMP_DIR:/zap/wrk \
+          zaproxy/zap-stable \
+          zap-baseline.py \
+          -t ${{ secrets.SPORTSREELZ_IMPORT_STAGING_URL }} \
+          -J zap-baseline-report.json \
+          -r zap-baseline-report.html \
+          -x zap-baseline-report.xml \
+          -I || echo "ZAP scan completed"
+        
+        cp $TEMP_DIR/* dast-reports/ 2>/dev/null || echo "No files to copy"
+        rm -rf $TEMP_DIR
+        
+        echo "Files in dast-reports:"
+        ls -la dast-reports/
+
+    - name: Analyze DAST Results
+      run: |
+        cd dast-reports
+        if [ -f "zap-baseline-report.json" ]; then
+          HIGH_ISSUES=$(jq '[.site[]?.alerts[]? | select(.riskdesc | test("High"))] | length' zap-baseline-report.json 2>/dev/null || echo 0)
+          MEDIUM_ISSUES=$(jq '[.site[]?.alerts[]? | select(.riskdesc | test("Medium"))] | length' zap-baseline-report.json 2>/dev/null || echo 0)
+          LOW_ISSUES=$(jq '[.site[]?.alerts[]? | select(.riskdesc | test("Low"))] | length' zap-baseline-report.json 2>/dev/null || echo 0)
+          
+          echo "📊 DAST Results Summary:"
+          echo "   High Risk: $HIGH_ISSUES"
+          echo "   Medium Risk: $MEDIUM_ISSUES"
+          echo "   Low Risk: $LOW_ISSUES"
+          
+          echo "DAST Scan Results" > dast-summary.txt
+          echo "High: $HIGH_ISSUES, Medium: $MEDIUM_ISSUES, Low: $LOW_ISSUES" >> dast-summary.txt
+          echo "Status: Completed Successfully" >> dast-summary.txt
+          
+          if [ "$HIGH_ISSUES" -gt 5 ]; then
+            echo "❌ DAST found $HIGH_ISSUES high-risk vulnerabilities (threshold: 5)"
+            exit 1
+          else
+            echo "✅ DAST completed - $HIGH_ISSUES high-risk issues found (within threshold)"
+          fi
+        else
+          echo "⚠️ No DAST JSON report generated"
+          echo "DAST Scan Results" > dast-summary.txt
+          echo "Status: Failed to generate reports" >> dast-summary.txt
+        fi
+
+    - name: Upload DAST Reports
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: dast-reports-sportsreelz-import-staging
+        path: dast-reports/
+        retention-days: 30
+        if-no-files-found: warn
