@@ -80,22 +80,45 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
     # lower (YouTube caps pre-merged at 720p) but the download still succeeds.
     ffmpeg_available = _shutil.which("ffmpeg") is not None
 
+    # Format selector strategy: prefer MP4/M4A streams when available, but fall
+    # back gracefully through WebM and then to any best video+audio combo.
+    # YouTube often serves higher resolutions only in WebM (VP9/AV1), so a
+    # strict [ext=mp4] requirement triggers "Requested format is not available"
+    # on those videos. yt-dlp's --merge-output-format mp4 still produces a .mp4
+    # at the end regardless of the source container.
     if ffmpeg_available:
-        fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        # Three-tier fallback for each quality bucket:
+        #   1. Try MP4/M4A (cleanest, no transcode on merge)
+        #   2. Try any video+audio at that height
+        #   3. Try any best single-file at that height
         if quality == "720p":
-            fmt = "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best"
+            fmt = ("bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+                   "bestvideo[height<=720]+bestaudio/"
+                   "best[height<=720]/best")
         elif quality == "480p":
-            fmt = "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best"
+            fmt = ("bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
+                   "bestvideo[height<=480]+bestaudio/"
+                   "best[height<=480]/best")
         elif quality == "1080p":
-            fmt = "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best"
+            fmt = ("bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+                   "bestvideo[height<=1080]+bestaudio/"
+                   "best[height<=1080]/best")
+        else:
+            fmt = ("bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                   "bestvideo+bestaudio/best")
     else:
-        fmt = "best[ext=mp4]/best"
+        # No FFmpeg available — must use pre-merged single-file formats.
+        # YouTube caps pre-merged at 720p so 1080p falls back to 720p.
         if quality == "720p":
             fmt = "best[height<=720][ext=mp4]/best[height<=720]/best"
         elif quality == "480p":
             fmt = "best[height<=480][ext=mp4]/best[height<=480]/best"
         elif quality == "1080p":
-            fmt = "best[height<=1080][ext=mp4]/best[height<=1080]/best"
+            # Pre-merged 1080p rarely exists on YouTube; cap at 720p when
+            # FFmpeg cannot merge separate streams.
+            fmt = "best[height<=720][ext=mp4]/best[height<=720]/best"
+        else:
+            fmt = "best[ext=mp4]/best"
 
     cmd = [
         sys.executable, "-m", "yt_dlp",

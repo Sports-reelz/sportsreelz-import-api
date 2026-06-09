@@ -9,9 +9,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  
 WORKDIR /app
  
-# Create cookies mount point
+RUN mkdir -p /app/data /app/cookies \
+    && rm -rf /app/cookies/youtube_cookies.txt \
+    && touch /app/cookies/youtube_cookies.txt
 
-RUN mkdir -p /app/cookies
+# Declare mount points (bind these via docker-compose volumes)
+VOLUME ["/app/data", "/app/cookies"]
  
 # Install Python dependencies
 
