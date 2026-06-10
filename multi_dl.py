@@ -130,6 +130,23 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
         "--newline",   # Progress on new lines for easier parsing
     ]
 
+    # YouTube bot-detection mitigation. YouTube's default web player client
+    # is the most aggressively gated against datacenter IPs. Forcing yt-dlp
+    # to try the tv-embedded and ios clients first (in addition to web)
+    # routes the request through endpoints that historically have weaker
+    # bot-detection coverage. Honors YT_DLP_PLAYER_CLIENT for operators
+    # who want to customise the priority list per deployment.
+    is_youtube = (
+        "youtube.com" in (result.source_url or result.direct_url or "")
+        or "youtu.be" in (result.source_url or result.direct_url or "")
+    )
+    if is_youtube:
+        player_clients = os.environ.get(
+            "YT_DLP_PLAYER_CLIENT",
+            "tv_embedded,ios,android,web_safari,web",
+        )
+        cmd += ["--extractor-args", f"youtube:player_client={player_clients}"]
+
     # Cookie handling. YouTube has been rolling out aggressive bot-detection
     # (the "Sign in to confirm you're not a bot" error). Pass a cookies file
     # from a signed-in browser to bypass it.
