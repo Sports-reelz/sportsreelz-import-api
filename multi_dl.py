@@ -145,7 +145,23 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
             "YT_DLP_PLAYER_CLIENT",
             "tv_embedded,ios,android,web_safari,web",
         )
-        cmd += ["--extractor-args", f"youtube:player_client={player_clients}"]
+        # YouTube's 2026 PO Token gate: even with the lower-gated clients,
+        # YouTube can refuse formats that don't carry a Proof-of-Origin token.
+        # `formats=missing_pot` tells yt-dlp to keep formats that lack a PO
+        # token so they can still be downloaded. This is the documented
+        # escape valve for datacenter-IP deployments without a bgutil
+        # PO Token provider sidecar.
+        youtube_formats = os.environ.get(
+            "YT_DLP_YOUTUBE_FORMATS",
+            "missing_pot",
+        )
+        cmd += [
+            "--extractor-args",
+            (
+                f"youtube:player_client={player_clients}"
+                f";formats={youtube_formats}"
+            ),
+        ]
 
     # Cookie handling. YouTube has been rolling out aggressive bot-detection
     # (the "Sign in to confirm you're not a bot" error). Pass a cookies file

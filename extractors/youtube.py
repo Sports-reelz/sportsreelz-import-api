@@ -42,15 +42,27 @@ class YouTubeExtractor(BaseExtractor):
             "--no-playlist",        # Single video only
         ]
 
-        # Bot-detection mitigation: use less-gated player clients first.
-        # Mirrors the same env var honored by multi_dl.download_with_ytdlp
-        # so both code paths route through the same client list.
+        # Bot-detection mitigation: use less-gated player clients first
+        # plus the formats=missing_pot escape valve to accept formats
+        # YouTube serves without a Proof-of-Origin token. Both behaviors
+        # mirror the same env vars honored by multi_dl.download_with_ytdlp
+        # so info-extraction and download stages stay in sync.
         import os as _os_pc
         player_clients = _os_pc.environ.get(
             "YT_DLP_PLAYER_CLIENT",
             "tv_embedded,ios,android,web_safari,web",
         )
-        cmd += ["--extractor-args", f"youtube:player_client={player_clients}"]
+        youtube_formats = _os_pc.environ.get(
+            "YT_DLP_YOUTUBE_FORMATS",
+            "missing_pot",
+        )
+        cmd += [
+            "--extractor-args",
+            (
+                f"youtube:player_client={player_clients}"
+                f";formats={youtube_formats}"
+            ),
+        ]
 
         # Cookie handling. YouTube has been rolling out aggressive bot-detection
         # ("Sign in to confirm you're not a bot"). Pass a cookies file from a
