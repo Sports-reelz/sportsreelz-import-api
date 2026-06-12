@@ -162,6 +162,18 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
                 f";formats={youtube_formats}"
             ),
         ]
+        # If a bgutil PO Token provider sidecar is configured, point the
+        # bgutil-ytdlp-pot-provider plugin at it. The plugin auto-attaches
+        # to every YouTube call and generates valid PO Tokens that even
+        # the most aggressive datacenter-IP gating accepts. Without this,
+        # the player_client + formats=missing_pot fallbacks may still get
+        # gated on hardened YouTube CDN nodes (AWS Mumbai, GCP us-east, etc).
+        bgutil_url = os.environ.get("BGUTIL_BASE_URL")
+        if bgutil_url:
+            cmd += [
+                "--extractor-args",
+                f"youtubepot-bgutilhttp:base_url={bgutil_url}",
+            ]
 
     # Cookie handling. YouTube has been rolling out aggressive bot-detection
     # (the "Sign in to confirm you're not a bot" error). Pass a cookies file

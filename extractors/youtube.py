@@ -63,6 +63,15 @@ class YouTubeExtractor(BaseExtractor):
                 f";formats={youtube_formats}"
             ),
         ]
+        # Optional bgutil PO Token provider sidecar. Same env var honored
+        # by multi_dl.download_with_ytdlp so info-extraction and download
+        # stages route through the same PO Token source.
+        bgutil_url = _os_pc.environ.get("BGUTIL_BASE_URL")
+        if bgutil_url:
+            cmd += [
+                "--extractor-args",
+                f"youtubepot-bgutilhttp:base_url={bgutil_url}",
+            ]
 
         # Cookie handling. YouTube has been rolling out aggressive bot-detection
         # ("Sign in to confirm you're not a bot"). Pass a cookies file from a
