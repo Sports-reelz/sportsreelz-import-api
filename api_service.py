@@ -17,9 +17,11 @@ Run:
 import os
 import uuid
 import time
+import json
 import logging
 import tempfile
 import shutil
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
@@ -55,6 +57,17 @@ NORMALIZE_VIDEO = os.environ.get("NORMALIZE_VIDEO", "true").lower() == "true"
 # webhook path is used instead.
 S3_BUCKET = os.environ.get("S3_BUCKET", "") or os.environ.get("S3_INPUT_BUCKET", "")
 S3_PUBLIC = os.environ.get("S3_PUBLIC", "false").lower() == "true"
+
+# Persistent job state — without this, jobs disappear on every API restart
+# (docker-compose restart, container redeploy, worker crash) and the client
+# polling for job status gets "Job not found" even though the underlying
+# download may have completed and the file is already in S3.
+#
+# Default path uses ./data/jobs.json relative to the working directory.
+# Override with JOBS_FILE to point at a path that survives container redeploys
+# (e.g. a Docker named volume or bind mount).
+JOBS_FILE = os.environ.get("JOBS_FILE", os.path.join(os.getcwd(), "data", "jobs.json"))
+JOBS_PERSIST_INTERVAL = float(os.environ.get("JOBS_PERSIST_INTERVAL", "2.0"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("api_service")
@@ -117,6 +130,112 @@ try:
     ffmpeg_path = find_ffmpeg()
 except FileNotFoundError:
     ffmpeg_path = "ffmpeg"
+
+
+# ── Job persistence ───────────────────────────────────────────────────────────
+# Survives API restarts so clients polling for job_id status don't see
+# "Job not found" responses for jobs that started before the restart.
+
+_jobs_lock = threading.Lock()
+_jobs_dirty = False
+
+
+def _serialize_jobs() -> dict:
+    """Filter jobs dict to only JSON-serialisable fields (no thread locks,
+    futures, callbacks, etc.) so it can be written to disk safely."""
+    out = {}
+    for jid, job in jobs.items():
+        clean = {}
+        for k, v in job.items():
+            if isinstance(v, (str, int, float, bool, list, dict, type(None))):
+                clean[k] = v
+        out[jid] = clean
+    return out
+
+
+def _persist_jobs():
+    """Atomically write the current jobs dict to disk."""
+    global _jobs_dirty
+    try:
+        os.makedirs(os.path.dirname(JOBS_FILE) or ".", exist_ok=True)
+        payload = _serialize_jobs()
+        tmp = JOBS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, JOBS_FILE)
+        _jobs_dirty = False
+    except Exception as e:
+        log.warning(f"Failed to persist jobs to {JOBS_FILE}: {e}")
+
+
+def _load_jobs():
+    """Restore jobs from disk at startup. Jobs that were in non-terminal
+    states (queued, downloading, processing, uploading, pending_verification)
+    when the previous process died are marked as 'error' with a clear message
+    rather than being left in a state that can never make progress."""
+    if not os.path.isfile(JOBS_FILE):
+        return
+    try:
+        with open(JOBS_FILE, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        terminal = {"done", "error"}
+        recovered = 0
+        marked_stale = 0
+        for jid, jdata in (loaded or {}).items():
+            if not isinstance(jdata, dict):
+                continue
+            status = jdata.get("status")
+            if status not in terminal:
+                jdata["status"] = "error"
+                jdata["error"] = (
+                    jdata.get("error")
+                    or "Job state lost — the API process restarted while this "
+                       "job was in flight. Re-submit /api/import to retry."
+                )
+                jdata["updated_at"] = time.time()
+                marked_stale += 1
+            jobs[jid] = jdata
+            recovered += 1
+        log.info(
+            f"Restored {recovered} jobs from {JOBS_FILE} "
+            f"({marked_stale} were in-flight and marked stale)"
+        )
+    except Exception as e:
+        log.warning(f"Failed to load jobs from {JOBS_FILE}: {e}")
+
+
+def _persistence_loop():
+    """Background thread: writes jobs to disk at most every
+    JOBS_PERSIST_INTERVAL seconds, but only when something changed."""
+    last_snapshot_hash = None
+    while True:
+        try:
+            time.sleep(JOBS_PERSIST_INTERVAL)
+            with _jobs_lock:
+                snapshot_hash = hash(json.dumps(
+                    _serialize_jobs(), sort_keys=True, ensure_ascii=False
+                ))
+                if snapshot_hash != last_snapshot_hash:
+                    _persist_jobs()
+                    last_snapshot_hash = snapshot_hash
+        except Exception:
+            # Persistence is best-effort. If anything in the loop fails,
+            # log nothing (would spam) and try again next tick.
+            pass
+
+
+@app.on_event("startup")
+def _on_startup():
+    _load_jobs()
+    t = threading.Thread(target=_persistence_loop, daemon=True, name="jobs-persist")
+    t.start()
+
+
+@app.on_event("shutdown")
+def _on_shutdown():
+    # Flush one last time so anything updated in the last
+    # JOBS_PERSIST_INTERVAL is captured before the process exits.
+    _persist_jobs()
 
 
 # ── Auth Middleware ───────────────────────────────────────────────────────────
@@ -514,11 +633,18 @@ def _process_job(job_id: str, cookies: dict = None, session_token: str = None):
         try:
             import requests as req
 
+            # jobId is the correlation key the webhook receiver uses to
+            # match this notification back to the /api/import request that
+            # triggered it. Without it the receiver can't disambiguate
+            # multiple concurrent imports from the same user (one user can
+            # have several jobs in flight at once).
             payload = {
+                "jobId": job_id,
                 "videoUrl": s3_url,
                 "userID": job["user_id"],
                 "title": result.title,
                 "platform": result.platform,
+                "createdAt": job.get("created_at"),
             }
             if result.duration:
                 payload["duration"] = int(result.duration)
@@ -538,14 +664,19 @@ def _process_job(job_id: str, cookies: dict = None, session_token: str = None):
             else:
                 # No S3 upload happened — fall back to multipart file upload
                 # for backward compatibility with deployments that don't use
-                # S3 at all.
+                # S3 at all. jobId is included as a form field so the
+                # receiver can still correlate even without the JSON path.
                 with open(output_path, "rb") as f:
                     files = {"video": (filename, f, "video/mp4")}
                     data = {
+                        "jobId": job_id,
                         "userID": str(job["user_id"]),
                         "title": result.title,
                         "platform": result.platform,
                     }
+                    created_at = job.get("created_at")
+                    if created_at is not None:
+                        data["createdAt"] = str(created_at)
                     if result.duration:
                         data["duration"] = str(int(result.duration))
                     resp = req.post(
