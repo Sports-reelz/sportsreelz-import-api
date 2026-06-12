@@ -116,7 +116,7 @@ jobs:
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID_STAGING }}" \
             --document-name "AWS-RunShellScript" \
-            --parameters 'commands=["aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 000009587073.dkr.ecr.ap-south-1.amazonaws.com && cd /opt/sportsreelz-import-api && docker-compose pull && docker-compose down && docker-compose up -d && sleep 10 && curl -f http://localhost:8000/api/health && docker image prune -af"]' \
+            --parameters 'commands=["aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 000009587073.dkr.ecr.ap-south-1.amazonaws.com && cd /opt/sportsreelz-import-api && docker compose pull && docker compose down && docker compose up -d && sleep 10 && curl -f http://localhost:8000/api/health && docker image prune -af"]' \
             --timeout-seconds 600 \
             --comment "Deploy sportsreelz-import-api staging" \
             --query "Command.CommandId" \
