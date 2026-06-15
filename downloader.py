@@ -11,6 +11,37 @@ import time
 from utils import find_ffmpeg, format_size, format_duration, format_speed, get_unique_filepath
 
 
+# Patterns for redacting secrets out of subprocess output before it is
+# surfaced in API responses, jobs.json, or logs. FFmpeg and yt-dlp echo the
+# signed input URL (tokens live in the query string) and -headers/--add-header
+# values (Cookie, Authorization) into their stderr on failure.
+_SECRET_LINE_RE = re.compile(
+    r"(?i)(authorization|cookie|set-cookie|x-api-key|bearer|token=|signature=|x-amz-)"
+)
+_URL_QUERY_RE = re.compile(r"(https?://[^\s?'\"]+)\?[^\s'\"]*")
+
+
+def _redact_sensitive(line: str) -> str:
+    """Redact secrets from a single line of subprocess output.
+
+    - Any line mentioning an auth header / token / AWS-signature param is
+      dropped entirely (it is never safe to surface).
+    - Otherwise, strip the query string off any URL so signed S3/CDN tokens
+      don't leak while keeping the host/path useful for diagnosis.
+    """
+    if not line:
+        return line
+    # Strip query strings off URLs first — signed S3/CDN tokens (X-Amz-*,
+    # signature=, token=) live there. Doing this first preserves the useful
+    # host/path for diagnosis instead of dropping the whole line.
+    line = _URL_QUERY_RE.sub(r"\1?<redacted>", line)
+    # Then drop any line still carrying a bare auth header or token (e.g. an
+    # echoed Cookie: / Authorization: header, or a non-URL token=...).
+    if _SECRET_LINE_RE.search(line):
+        return "<redacted: contained credentials>"
+    return line
+
+
 class DownloadProgress:
     """Tracks download progress state."""
     def __init__(self):
@@ -161,6 +192,15 @@ class HudlDownloader:
         """Parse FFmpeg stderr for progress info."""
         stderr_data = b""
         duration_seconds = None
+        # Ring buffer of the most recent stderr bytes. FFmpeg writes its
+        # final error message (e.g. "No space left on device", "Cannot
+        # allocate memory", "Conversion failed", codec errors) to stderr
+        # right before it exits. We retain the tail here so _get_stderr_tail
+        # can surface it — the pipe itself is already drained to EOF by the
+        # time the caller checks the return code, so re-reading it returns
+        # nothing. Without this the error field was always empty, which is
+        # why every "FFmpeg exited with code N: " had no reason attached.
+        self._stderr_tail = b""
 
         while True:
             if self._cancel_event.is_set():
@@ -171,6 +211,9 @@ class HudlDownloader:
                 break
 
             stderr_data += chunk
+            # Retain a generous tail (last ~8KB) across the whole run so the
+            # final error survives even after the progress buffer is trimmed.
+            self._stderr_tail = (self._stderr_tail + chunk)[-8192:]
             text = stderr_data.decode("utf-8", errors="replace")
 
             # Try to extract total duration from stream info
@@ -228,16 +271,33 @@ class HudlDownloader:
             progress.speed = f"{spd:.1f}x"
 
     def _get_stderr_tail(self, proc) -> str:
-        """Get the last bit of stderr for error messages."""
+        """Get the last bit of stderr for error messages.
+
+        Returns the tail buffered by _read_progress during the run. The pipe
+        is already at EOF here (the progress reader drained it), so reading
+        proc.stderr again yields nothing — we must use the retained buffer.
+        We also attempt one final read in case any bytes arrived after the
+        reader loop exited, appending them to the buffered tail.
+        """
+        buffered = getattr(self, "_stderr_tail", b"") or b""
         try:
             remaining = proc.stderr.read()
             if remaining:
-                text = remaining.decode("utf-8", errors="replace")
-                # Return last 200 chars
-                return text.strip()[-200:]
+                buffered = (buffered + remaining)[-8192:]
         except Exception:
             pass
-        return ""
+        if not buffered:
+            return ""
+        text = buffered.decode("utf-8", errors="replace")
+        # Collapse FFmpeg's \r-heavy progress noise to newlines, then return
+        # the last few non-empty lines — that's where the real error lives.
+        # Redact first: FFmpeg echoes the (signed) input URL and -headers
+        # values (Cookie/Authorization) into stderr on HTTP errors, and this
+        # text flows into the API-visible error field, jobs.json, and logs.
+        text = text.replace("\r", "\n")
+        lines = [_redact_sensitive(ln.strip()) for ln in text.split("\n") if ln.strip()]
+        tail = " | ".join(lines[-4:]) if lines else ""
+        return tail[-500:]
 
     def _cleanup_partial(self, path: str):
         """Remove partial download file."""
