@@ -31,7 +31,7 @@ except ImportError:
 from extractors import extract, get_platform
 from extractors.base import ExtractionError, AuthRequiredError, ExtractResult
 from quality import fetch_and_select, format_variants_table
-from downloader import HudlDownloader, DownloadProgress
+from downloader import HudlDownloader, DownloadProgress, _redact_sensitive
 from utils import find_ffmpeg, sanitize_filename, get_unique_filepath, format_size, read_urls_from_file
 
 
@@ -211,8 +211,17 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
         )
 
         import re
+        from collections import deque
+        # Retain the last lines of yt-dlp's combined stdout+stderr so a
+        # failure can report WHY it failed. Without this the error was a
+        # bare "yt-dlp exited with code N" with no detail — which is why
+        # VEO failures at 100% (a post-processing/merge step) were
+        # impossible to diagnose from the API response alone.
+        output_tail = deque(maxlen=40)
         for line in proc.stdout:
             line = line.strip()
+            if line:
+                output_tail.append(line)
             # Parse yt-dlp progress: [download]  xx.x% of ...
             m = re.search(r'\[download\]\s+([\d.]+)%', line)
             if m:
@@ -265,6 +274,15 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
             progress.time_elapsed = f"{int(elapsed//60)}m {int(elapsed%60)}s"
         else:
             progress.status = "error"
+            # Pull the most relevant lines out of the retained tail — yt-dlp
+            # prefixes hard failures with "ERROR:". Fall back to the last few
+            # lines if no explicit ERROR marker is present.
+            # Redact signed URLs / auth tokens that yt-dlp echoes into its
+            # ERROR lines before this flows into the API error field, jobs.json
+            # and logs.
+            tail_lines = [_redact_sensitive(ln) for ln in output_tail]
+            err_lines = [ln for ln in tail_lines if "ERROR:" in ln]
+            detail = " | ".join(err_lines[-2:] or tail_lines[-4:])[:500]
             if proc.returncode == 0:
                 if not ffmpeg_available:
                     progress.error = (
@@ -273,9 +291,16 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
                         "and add it to PATH, then retry."
                     )
                 else:
-                    progress.error = "Download completed but output file not found at the expected path."
+                    progress.error = (
+                        "Download completed but output file not found at the "
+                        "expected path."
+                        + (f" yt-dlp said: {detail}" if detail else "")
+                    )
             else:
-                progress.error = f"yt-dlp exited with code {proc.returncode}"
+                progress.error = (
+                    f"yt-dlp exited with code {proc.returncode}"
+                    + (f": {detail}" if detail else "")
+                )
 
     except FileNotFoundError:
         progress.status = "error"
