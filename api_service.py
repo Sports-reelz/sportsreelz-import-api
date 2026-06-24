@@ -15,6 +15,7 @@ Run:
 """
 
 import os
+import re
 import uuid
 import time
 import json
@@ -282,6 +283,11 @@ class StatusResponse(BaseModel):
     status: str
     platform: str
     title: Optional[str] = None
+    # Best-effort match metadata parsed from the title/platform. Null when the
+    # source doesn't expose it (e.g. an arbitrary YouTube title with no opponent).
+    team_name: Optional[str] = None
+    opponent_name: Optional[str] = None
+    game_date: Optional[str] = None
     percent: float = 0.0
     speed: Optional[str] = None
     error: Optional[str] = None
@@ -471,6 +477,9 @@ async def get_status(job_id: str):
         status=job["status"],
         platform=job["platform"],
         title=job.get("title"),
+        team_name=job.get("team_name"),
+        opponent_name=job.get("opponent_name"),
+        game_date=job.get("game_date"),
         percent=job.get("percent", 0.0),
         speed=job.get("speed"),
         error=job.get("error"),
@@ -512,6 +521,10 @@ def _process_job(job_id: str, cookies: dict = None, session_token: str = None):
         return
 
     job["title"] = result.title
+    team, opponent, game_date = _parse_match_meta(result.title, result.platform, result)
+    job["team_name"] = team
+    job["opponent_name"] = opponent
+    job["game_date"] = game_date
     log.info(f"[{job_id}] Extracted: {result.title} ({result.platform})")
 
     # ── Download ──────────────────────────────────────────────────────
@@ -643,6 +656,9 @@ def _process_job(job_id: str, cookies: dict = None, session_token: str = None):
                 "videoUrl": s3_url,
                 "userID": job["user_id"],
                 "title": result.title,
+                "teamName": job.get("team_name"),
+                "opponentName": job.get("opponent_name"),
+                "gameDate": job.get("game_date"),
                 "platform": result.platform,
                 "createdAt": job.get("created_at"),
             }
@@ -674,6 +690,12 @@ def _process_job(job_id: str, cookies: dict = None, session_token: str = None):
                         "title": result.title,
                         "platform": result.platform,
                     }
+                    if job.get("team_name"):
+                        data["teamName"] = job["team_name"]
+                    if job.get("opponent_name"):
+                        data["opponentName"] = job["opponent_name"]
+                    if job.get("game_date"):
+                        data["gameDate"] = job["game_date"]
                     created_at = job.get("created_at")
                     if created_at is not None:
                         data["createdAt"] = str(created_at)
@@ -755,6 +777,59 @@ def _normalize_video(input_path: str, output_path: str) -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+_VS_SPLIT_RE = re.compile(r"\s+(?:vs?\.?|versus)\s+", re.IGNORECASE)
+_DATE_RES = [
+    # 2026-04-10  /  2026/04/10
+    re.compile(r"\b(\d{4}[-/]\d{1,2}[-/]\d{1,2})\b"),
+    # 04/10/2026  /  4-10-26
+    re.compile(r"\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b"),
+    # Apr 10, 2026  /  April 10 2026
+    re.compile(
+        r"\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:,)?\s+\d{4})\b",
+        re.IGNORECASE,
+    ),
+    # 10 Apr 2026
+    re.compile(
+        r"\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4})\b",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _parse_match_meta(title, platform, result):
+    """Best-effort extraction of (team_name, opponent_name, game_date) from a
+    video title. Returns (None, None, None) for any piece that can't be parsed
+    confidently — we never guess. Titles like "Knob Noster girls soccer v.
+    Pleasant Hill - Apr 10, 2026" split cleanly; arbitrary YouTube titles
+    usually yield nulls, which is correct.
+    """
+    team = opponent = game_date = None
+    if not title:
+        return team, opponent, game_date
+
+    text = str(title).strip()
+
+    # 1. Pull a date out of the title if present, and remove it so it doesn't
+    #    contaminate the opponent name.
+    for rx in _DATE_RES:
+        m = rx.search(text)
+        if m:
+            game_date = m.group(1).strip().rstrip(",")
+            text = (text[: m.start()] + text[m.end():]).strip()
+            break
+
+    # 2. Strip common trailing separators left after date removal.
+    text = re.sub(r"[\s\-–—|]+$", "", text).strip()
+
+    # 3. Split "TeamA vs TeamB" into team / opponent.
+    parts = _VS_SPLIT_RE.split(text, maxsplit=1)
+    if len(parts) == 2:
+        team = parts[0].strip(" -–—|") or None
+        opponent = parts[1].strip(" -–—|") or None
+
+    return team, opponent, game_date
 
 
 def _parse_cookies_file(path: str) -> dict:
