@@ -820,10 +820,29 @@ def _parse_match_meta(title, platform, result):
             text = (text[: m.start()] + text[m.end():]).strip()
             break
 
-    # 2. Strip common trailing separators left after date removal.
+    # 2. Strip a trailing game-type label ("- Game", "- Scrimmage", etc.) and
+    #    any leftover trailing separators.
+    text = re.sub(
+        r"\s*[-–—|]\s*(?:game|scrimmage|match|friendly|highlights?)\s*$",
+        "", text, flags=re.IGNORECASE,
+    ).strip()
     text = re.sub(r"[\s\-–—|]+$", "", text).strip()
 
-    # 3. Split "TeamA vs TeamB" into team / opponent.
+    # 3a. "@ Opponent" — HUDL away-game convention: the leading "@" marks the
+    #     opponent (your own team isn't in the title). e.g. "@ PDA White ECNL
+    #     G13 - Game" -> opponent = "PDA White ECNL G13".
+    at_match = re.match(r"^@\s*(.+)$", text)
+    if at_match:
+        opponent = at_match.group(1).strip(" -–—|") or None
+        return team, opponent, game_date
+
+    # 3b. Leading "vs Opponent" / "v. Opponent" with no team before it.
+    lead_vs = re.match(r"^(?:vs?\.?|versus)\s+(.+)$", text, re.IGNORECASE)
+    if lead_vs:
+        opponent = lead_vs.group(1).strip(" -–—|") or None
+        return team, opponent, game_date
+
+    # 3c. "TeamA vs TeamB" in the middle -> team / opponent.
     parts = _VS_SPLIT_RE.split(text, maxsplit=1)
     if len(parts) == 2:
         team = parts[0].strip(" -–—|") or None

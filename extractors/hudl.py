@@ -399,9 +399,17 @@ class HudlExtractor(BaseExtractor):
         try:
             return self._extract_app_hudl_playwright(url, cookies, headers)
         except Exception as e:
+            # Login succeeded (we have cookies) but neither the GraphQL API nor
+            # the player exposed a stream URL. Be honest about which stage
+            # failed instead of blaming the session — that misdirected days of
+            # debugging onto auth when the real issue was stream resolution.
             raise ExtractionError(
-                f"Could not extract HUDL video — session may be expired.\n"
-                "Click 'Test Login' to refresh your HUDL session and try again."
+                "Could not locate the video stream on this app.hudl.com page. "
+                "Login worked, but neither HUDL's API nor the player exposed an "
+                "HLS manifest. This usually means the URL is a page type the "
+                "extractor doesn't yet handle, or the logged-in account lacks "
+                "access to this specific video. Paste the exact app.hudl.com URL "
+                f"and we'll add support. (detail: {e})"
             )
 
     def _extract_app_hudl_playwright(self, url: str, cookies,
@@ -425,7 +433,18 @@ class HudlExtractor(BaseExtractor):
 
         def _on_request(request):
             u = request.url
-            if captured["m3u8"] is None and "vd.hudl.com" in u and ".m3u8" in u:
+            if ".m3u8" not in u:
+                return
+            # Capture the HLS manifest the player fetches. HUDL has served
+            # video from several CDN hosts over time (vd.hudl.com, cdn.hudl.com,
+            # *.akamaihd.net, *.cloudfront.net, *.hudltech.com, ...), so we no
+            # longer hard-code a single host — hard-coding "vd.hudl.com" was
+            # causing app.hudl.com extraction to fail whenever the video was
+            # served from any other CDN. Take the first manifest we see, but
+            # upgrade to a master playlist if one appears.
+            if captured["m3u8"] is None:
+                captured["m3u8"] = u
+            elif "master" in u.lower() and "master" not in captured["m3u8"].lower():
                 captured["m3u8"] = u
 
         with sync_playwright() as p:
