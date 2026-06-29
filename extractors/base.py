@@ -54,6 +54,7 @@ class ExtractResult:
     # Metadata
     duration: Optional[float] = None        # seconds
     thumbnail: Optional[str] = None
+    team_name: Optional[str] = None         # owning team/school (e.g. HUDL team lookup)
 
     def __repr__(self):
         url = self.m3u8_url or self.direct_url or self.source_url or "?"

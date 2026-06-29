@@ -296,6 +296,15 @@ class StatusResponse(BaseModel):
     updated_at: float
 
 
+class ClearTraceSessionRequest(BaseModel):
+    email: Optional[str] = Field(
+        None,
+        description="Trace account email whose cached session to clear. "
+                    "Omit and set all=true to clear every session.",
+    )
+    all: bool = Field(False, description="Clear all cached Trace sessions.")
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
@@ -304,6 +313,38 @@ async def health():
         "status": "ok",
         "active_jobs": len([j for j in jobs.values() if j["status"] not in ("done", "error")]),
         "total_jobs": len(jobs),
+    }
+
+
+@app.post(
+    "/api/trace/clear-session",
+    tags=["Trace"],
+    summary="Clear cached Trace session",
+)
+async def clear_trace_session(req: ClearTraceSessionRequest):
+    """Clear a cached Trace session so the magic-code flow runs fresh on the
+    next import. Trace sessions are cached for 30 days; this lets you re-test
+    verification without waiting, and lets you reset a player whose session
+    has gone bad in production.
+
+    Body: {"email": "player@x.com"}  -> clears that email's session
+          {"all": true}             -> clears every cached session
+    """
+    if req.all:
+        n = trace_auth.clear_all_sessions()
+        return {"cleared": True, "scope": "all", "removed": n}
+    if not req.email:
+        raise HTTPException(400, "Provide 'email' or set 'all' to true")
+    removed = trace_auth.clear_session(req.email)
+    return {
+        "cleared": removed,
+        "scope": "email",
+        "email": req.email,
+        "message": (
+            "Session cleared — next import will re-trigger the magic code."
+            if removed else
+            "No cached session found for that email (nothing to clear)."
+        ),
     }
 
 
@@ -522,7 +563,10 @@ def _process_job(job_id: str, cookies: dict = None, session_token: str = None):
 
     job["title"] = result.title
     team, opponent, game_date = _parse_match_meta(result.title, result.platform, result)
-    job["team_name"] = team
+    # Prefer a team name the extractor resolved authoritatively (e.g. HUDL's
+    # team API) over the best-effort title parse — it's correct even for
+    # "@ Opponent" away-game titles where the home team isn't in the title.
+    job["team_name"] = getattr(result, "team_name", None) or team
     job["opponent_name"] = opponent
     job["game_date"] = game_date
     log.info(f"[{job_id}] Extracted: {result.title} ({result.platform})")

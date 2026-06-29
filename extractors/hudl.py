@@ -311,6 +311,16 @@ class HudlExtractor(BaseExtractor):
             "Origin": "https://app.hudl.com",
         }
 
+        # Resolve the owning team/school name from the team id in the URL
+        # (e.g. .../team/13520/... or ?team=13520). HUDL away-game titles are
+        # just "@ Opponent", so the home team isn't in the title — this lookup
+        # fills it in. Best-effort; never fatal to the extraction.
+        team_id = None
+        m_team = re.search(r"[?&]team=(\d+)", url) or re.search(r"/team/(\d+)", url)
+        if m_team:
+            team_id = m_team.group(1)
+        team_name = self._fetch_team_name(session, team_id, gql_headers) if team_id else None
+
         # Query HUDL GraphQL for playbackUrl
         # Try GraphQL queries from most to least fields.
         # GraphQL rejects unknown fields, so we cascade: if the broad query
@@ -387,6 +397,7 @@ class HudlExtractor(BaseExtractor):
                         m3u8_url=m3u8_url,
                         headers=stream_headers,
                         base_url=m3u8_url.rsplit("/", 1)[0] + "/",
+                        team_name=team_name,
                     )
             except Exception:
                 continue
@@ -397,7 +408,10 @@ class HudlExtractor(BaseExtractor):
         # Note: this requires cookies from login_with_browser() — old Chrome
         # exports may not have a valid app.hudl.com session.
         try:
-            return self._extract_app_hudl_playwright(url, cookies, headers)
+            res = self._extract_app_hudl_playwright(url, cookies, headers)
+            if res and not res.team_name:
+                res.team_name = team_name
+            return res
         except Exception as e:
             # Login succeeded (we have cookies) but neither the GraphQL API nor
             # the player exposed a stream URL. Be honest about which stage
@@ -411,6 +425,39 @@ class HudlExtractor(BaseExtractor):
                 "access to this specific video. Paste the exact app.hudl.com URL "
                 f"and we'll add support. (detail: {e})"
             )
+
+    def _fetch_team_name(self, session, team_id: str, gql_headers: dict):
+        """Resolve a HUDL numeric team id to a human-readable team/school name
+        via the HUDL GraphQL API. Returns the school's full name (e.g.
+        "Ardrey Kell High School"), optionally with the squad name appended
+        ("Ardrey Kell High School - Girls Varsity Soccer"). Best-effort —
+        returns None on any failure so it never blocks the actual extraction.
+        """
+        query = (
+            "query($id: String!){ team(id:$id){ name "
+            "school { fullName shortName } } }"
+        )
+        try:
+            resp = session.post(
+                "https://www.hudl.com/api/graphql/query",
+                json={"query": query, "variables": {"id": str(team_id)}},
+                headers=gql_headers,
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return None
+            body = resp.json()
+            team = (body.get("data") or {}).get("team") or {}
+            if not team:
+                return None
+            school = team.get("school") or {}
+            school_name = school.get("fullName") or school.get("shortName")
+            squad = team.get("name")
+            if school_name and squad and squad.lower() not in school_name.lower():
+                return f"{school_name} - {squad}"
+            return school_name or squad or None
+        except Exception:
+            return None
 
     def _extract_app_hudl_playwright(self, url: str, cookies,
                                       headers: dict) -> ExtractResult:
@@ -433,7 +480,7 @@ class HudlExtractor(BaseExtractor):
 
         def _on_request(request):
             u = request.url
-            if ".m3u8" not in u:
+            if ".m3u8" not in u and ".mpd" not in u:
                 return
             # Capture the HLS manifest the player fetches. HUDL has served
             # video from several CDN hosts over time (vd.hudl.com, cdn.hudl.com,
@@ -477,8 +524,29 @@ class HudlExtractor(BaseExtractor):
                 page.goto(url, wait_until="domcontentloaded", timeout=20000)
                 captured["title"] = page.title()
 
-                # Wait up to 15s for the video player to request the m3u8
-                deadline = _time.time() + 15
+                # The player does NOT request its manifest until playback is
+                # triggered, so just loading the page leaves no .m3u8 to catch
+                # (the "page loaded but no .m3u8 request detected" symptom).
+                # Click the play button to start the stream. Try a range of
+                # selectors HUDL has used, plus a click in the player area as
+                # a last resort.
+                for sel in (
+                    'button[aria-label*="play" i]',
+                    'button[title*="play" i]',
+                    '.vjs-big-play-button',
+                    '.hudl-play-button, .play-button, button.play',
+                    'video',
+                ):
+                    try:
+                        el = page.locator(sel).first
+                        if el.is_visible(timeout=1500):
+                            el.click(timeout=2000)
+                            break
+                    except Exception:
+                        continue
+
+                # Wait up to 25s for the player to request the manifest.
+                deadline = _time.time() + 25
                 while captured["m3u8"] is None and _time.time() < deadline:
                     _time.sleep(0.3)
 
@@ -489,8 +557,11 @@ class HudlExtractor(BaseExtractor):
 
         if not captured["m3u8"]:
             raise ExtractionError(
-                "Playwright fallback: page loaded but no .m3u8 request detected. "
-                "Session may be expired — click 'Test Login'."
+                "Playwright fallback: page loaded but no video manifest "
+                "(.m3u8/.mpd) request detected even after triggering playback. "
+                "The player may use an embedded/blob stream this path can't "
+                "intercept. Capturing the manifest URL from a logged-in "
+                "browser's DevTools Network tab would pinpoint it."
             )
 
         m3u8_url = captured["m3u8"]
