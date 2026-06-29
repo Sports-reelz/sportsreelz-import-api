@@ -82,6 +82,24 @@ class TraceAuthManager:
             return None
         return session.get("cookies")
 
+    def clear_session(self, email: str) -> bool:
+        """Forget a saved Trace session so the next import re-triggers the
+        magic-code flow. Returns True if a session existed and was removed.
+        Useful for testing the verification flow without waiting 30 days, and
+        in production when a player's cached session goes bad."""
+        if email in self._sessions:
+            del self._sessions[email]
+            self._save_sessions()
+            return True
+        return False
+
+    def clear_all_sessions(self) -> int:
+        """Forget every saved Trace session. Returns the count removed."""
+        n = len(self._sessions)
+        self._sessions = {}
+        self._save_sessions()
+        return n
+
     def request_magic_code(self, email: str) -> bool:
         """
         Trigger Trace to send a magic code to the given email.
