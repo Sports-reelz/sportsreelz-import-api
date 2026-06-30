@@ -40,10 +40,39 @@ jobs:
 
       - name: Deploy to Production Server via SSM
         run: |
-          aws ssm send-command \
+          COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID_PRODUCTION }}" \
             --document-name "AWS-RunShellScript" \
             --parameters 'commands=["aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 000009587073.dkr.ecr.us-west-2.amazonaws.com && cd /opt/sportsreelz-import-api && docker-compose pull && docker-compose down && docker-compose up -d && sleep 10 && curl -f http://localhost:8000/api/health"]' \
             --timeout-seconds 600 \
             --comment "Deploy sportsreelz-import-api to production" \
-            --output text
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          # Wait for the command to complete
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID_PRODUCTION }}" || true
+
+          # Check the result
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID_PRODUCTION }}" \
+            --query "Status" \
+            --output text)
+
+          echo "Command Status: $STATUS"
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "❌ Deployment failed!"
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "${{ secrets.EC2_INSTANCE_ID_PRODUCTION }}" \
+              --query "StandardErrorContent" \
+              --output text
+            exit 1
+          fi
+
+          echo "✅ Production deployment successful"
