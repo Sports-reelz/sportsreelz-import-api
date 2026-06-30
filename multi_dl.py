@@ -31,7 +31,7 @@ except ImportError:
 from extractors import extract, get_platform
 from extractors.base import ExtractionError, AuthRequiredError, ExtractResult
 from quality import fetch_and_select, format_variants_table
-from downloader import HudlDownloader, DownloadProgress
+from downloader import HudlDownloader, DownloadProgress, _redact_sensitive
 from utils import find_ffmpeg, sanitize_filename, get_unique_filepath, format_size, read_urls_from_file
 
 
@@ -80,22 +80,45 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
     # lower (YouTube caps pre-merged at 720p) but the download still succeeds.
     ffmpeg_available = _shutil.which("ffmpeg") is not None
 
+    # Format selector strategy: prefer MP4/M4A streams when available, but fall
+    # back gracefully through WebM and then to any best video+audio combo.
+    # YouTube often serves higher resolutions only in WebM (VP9/AV1), so a
+    # strict [ext=mp4] requirement triggers "Requested format is not available"
+    # on those videos. yt-dlp's --merge-output-format mp4 still produces a .mp4
+    # at the end regardless of the source container.
     if ffmpeg_available:
-        fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        # Three-tier fallback for each quality bucket:
+        #   1. Try MP4/M4A (cleanest, no transcode on merge)
+        #   2. Try any video+audio at that height
+        #   3. Try any best single-file at that height
         if quality == "720p":
-            fmt = "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best"
+            fmt = ("bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+                   "bestvideo[height<=720]+bestaudio/"
+                   "best[height<=720]/best")
         elif quality == "480p":
-            fmt = "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best"
+            fmt = ("bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
+                   "bestvideo[height<=480]+bestaudio/"
+                   "best[height<=480]/best")
         elif quality == "1080p":
-            fmt = "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best"
+            fmt = ("bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+                   "bestvideo[height<=1080]+bestaudio/"
+                   "best[height<=1080]/best")
+        else:
+            fmt = ("bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                   "bestvideo+bestaudio/best")
     else:
-        fmt = "best[ext=mp4]/best"
+        # No FFmpeg available — must use pre-merged single-file formats.
+        # YouTube caps pre-merged at 720p so 1080p falls back to 720p.
         if quality == "720p":
             fmt = "best[height<=720][ext=mp4]/best[height<=720]/best"
         elif quality == "480p":
             fmt = "best[height<=480][ext=mp4]/best[height<=480]/best"
         elif quality == "1080p":
-            fmt = "best[height<=1080][ext=mp4]/best[height<=1080]/best"
+            # Pre-merged 1080p rarely exists on YouTube; cap at 720p when
+            # FFmpeg cannot merge separate streams.
+            fmt = "best[height<=720][ext=mp4]/best[height<=720]/best"
+        else:
+            fmt = "best[ext=mp4]/best"
 
     cmd = [
         sys.executable, "-m", "yt_dlp",
@@ -107,8 +130,69 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
         "--newline",   # Progress on new lines for easier parsing
     ]
 
-    if cookies_path:
-        cmd += ["--cookies", cookies_path]
+    # YouTube bot-detection mitigation. YouTube's default web player client
+    # is the most aggressively gated against datacenter IPs. Forcing yt-dlp
+    # to try the tv-embedded and ios clients first (in addition to web)
+    # routes the request through endpoints that historically have weaker
+    # bot-detection coverage. Honors YT_DLP_PLAYER_CLIENT for operators
+    # who want to customise the priority list per deployment.
+    is_youtube = (
+        "youtube.com" in (result.source_url or result.direct_url or "")
+        or "youtu.be" in (result.source_url or result.direct_url or "")
+    )
+    if is_youtube:
+        player_clients = os.environ.get(
+            "YT_DLP_PLAYER_CLIENT",
+            "tv_embedded,ios,android,web_safari,web",
+        )
+        # YouTube's 2026 PO Token gate: even with the lower-gated clients,
+        # YouTube can refuse formats that don't carry a Proof-of-Origin token.
+        # `formats=missing_pot` tells yt-dlp to keep formats that lack a PO
+        # token so they can still be downloaded. This is the documented
+        # escape valve for datacenter-IP deployments without a bgutil
+        # PO Token provider sidecar.
+        youtube_formats = os.environ.get(
+            "YT_DLP_YOUTUBE_FORMATS",
+            "missing_pot",
+        )
+        cmd += [
+            "--extractor-args",
+            (
+                f"youtube:player_client={player_clients}"
+                f";formats={youtube_formats}"
+            ),
+        ]
+        # If a bgutil PO Token provider sidecar is configured, point the
+        # bgutil-ytdlp-pot-provider plugin at it. The plugin auto-attaches
+        # to every YouTube call and generates valid PO Tokens that even
+        # the most aggressive datacenter-IP gating accepts. Without this,
+        # the player_client + formats=missing_pot fallbacks may still get
+        # gated on hardened YouTube CDN nodes (AWS Mumbai, GCP us-east, etc).
+        bgutil_url = os.environ.get("BGUTIL_BASE_URL")
+        if bgutil_url:
+            cmd += [
+                "--extractor-args",
+                f"youtubepot-bgutilhttp:base_url={bgutil_url}",
+            ]
+
+    # Cookie handling. YouTube has been rolling out aggressive bot-detection
+    # (the "Sign in to confirm you're not a bot" error). Pass a cookies file
+    # from a signed-in browser to bypass it.
+    #
+    # Priority:
+    #   1. cookies_path passed in by the caller (per-request)
+    #   2. YT_DLP_COOKIES_FILE env var (applies to all yt-dlp downloads)
+    #   3. YOUTUBE_COOKIES_FILE env var (legacy name, same behavior)
+    #   4. YT_DLP_COOKIES_FROM_BROWSER env var (e.g. "chrome", "firefox") —
+    #      uses Playwright/yt-dlp browser-cookie extraction on the host
+    effective_cookies = cookies_path or os.environ.get("YT_DLP_COOKIES_FILE") \
+        or os.environ.get("YOUTUBE_COOKIES_FILE")
+    if effective_cookies and os.path.isfile(effective_cookies):
+        cmd += ["--cookies", effective_cookies]
+
+    cookies_from_browser = os.environ.get("YT_DLP_COOKIES_FROM_BROWSER")
+    if cookies_from_browser and not effective_cookies:
+        cmd += ["--cookies-from-browser", cookies_from_browser]
 
     # Add source-specific headers
     for k, v in (result.headers or {}).items():
@@ -127,8 +211,17 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
         )
 
         import re
+        from collections import deque
+        # Retain the last lines of yt-dlp's combined stdout+stderr so a
+        # failure can report WHY it failed. Without this the error was a
+        # bare "yt-dlp exited with code N" with no detail — which is why
+        # VEO failures at 100% (a post-processing/merge step) were
+        # impossible to diagnose from the API response alone.
+        output_tail = deque(maxlen=40)
         for line in proc.stdout:
             line = line.strip()
+            if line:
+                output_tail.append(line)
             # Parse yt-dlp progress: [download]  xx.x% of ...
             m = re.search(r'\[download\]\s+([\d.]+)%', line)
             if m:
@@ -181,6 +274,15 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
             progress.time_elapsed = f"{int(elapsed//60)}m {int(elapsed%60)}s"
         else:
             progress.status = "error"
+            # Pull the most relevant lines out of the retained tail — yt-dlp
+            # prefixes hard failures with "ERROR:". Fall back to the last few
+            # lines if no explicit ERROR marker is present.
+            # Redact signed URLs / auth tokens that yt-dlp echoes into its
+            # ERROR lines before this flows into the API error field, jobs.json
+            # and logs.
+            tail_lines = [_redact_sensitive(ln) for ln in output_tail]
+            err_lines = [ln for ln in tail_lines if "ERROR:" in ln]
+            detail = " | ".join(err_lines[-2:] or tail_lines[-4:])[:500]
             if proc.returncode == 0:
                 if not ffmpeg_available:
                     progress.error = (
@@ -189,9 +291,16 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
                         "and add it to PATH, then retry."
                     )
                 else:
-                    progress.error = "Download completed but output file not found at the expected path."
+                    progress.error = (
+                        "Download completed but output file not found at the "
+                        "expected path."
+                        + (f" yt-dlp said: {detail}" if detail else "")
+                    )
             else:
-                progress.error = f"yt-dlp exited with code {proc.returncode}"
+                progress.error = (
+                    f"yt-dlp exited with code {proc.returncode}"
+                    + (f": {detail}" if detail else "")
+                )
 
     except FileNotFoundError:
         progress.status = "error"

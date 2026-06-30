@@ -42,10 +42,54 @@ class YouTubeExtractor(BaseExtractor):
             "--no-playlist",        # Single video only
         ]
 
-        # Add cookies if provided (path to cookies.txt or dict)
+        # Bot-detection mitigation: use less-gated player clients first
+        # plus the formats=missing_pot escape valve to accept formats
+        # YouTube serves without a Proof-of-Origin token. Both behaviors
+        # mirror the same env vars honored by multi_dl.download_with_ytdlp
+        # so info-extraction and download stages stay in sync.
+        import os as _os_pc
+        player_clients = _os_pc.environ.get(
+            "YT_DLP_PLAYER_CLIENT",
+            "tv_embedded,ios,android,web_safari,web",
+        )
+        youtube_formats = _os_pc.environ.get(
+            "YT_DLP_YOUTUBE_FORMATS",
+            "missing_pot",
+        )
+        cmd += [
+            "--extractor-args",
+            (
+                f"youtube:player_client={player_clients}"
+                f";formats={youtube_formats}"
+            ),
+        ]
+        # Optional bgutil PO Token provider sidecar. Same env var honored
+        # by multi_dl.download_with_ytdlp so info-extraction and download
+        # stages route through the same PO Token source.
+        bgutil_url = _os_pc.environ.get("BGUTIL_BASE_URL")
+        if bgutil_url:
+            cmd += [
+                "--extractor-args",
+                f"youtubepot-bgutilhttp:base_url={bgutil_url}",
+            ]
+
+        # Cookie handling. YouTube has been rolling out aggressive bot-detection
+        # ("Sign in to confirm you're not a bot"). Pass a cookies file from a
+        # signed-in browser to bypass it. Priority: explicit cookies arg, then
+        # YT_DLP_COOKIES_FILE env var, then YOUTUBE_COOKIES_FILE (legacy).
+        import os as _os
+        effective_cookies = None
         if isinstance(cookies, str):
-            # Treated as path to Netscape cookies file
-            cmd += ["--cookies", cookies]
+            effective_cookies = cookies
+        else:
+            effective_cookies = (_os.environ.get("YT_DLP_COOKIES_FILE")
+                                 or _os.environ.get("YOUTUBE_COOKIES_FILE"))
+        if effective_cookies and _os.path.isfile(effective_cookies):
+            cmd += ["--cookies", effective_cookies]
+
+        cookies_from_browser = _os.environ.get("YT_DLP_COOKIES_FROM_BROWSER")
+        if cookies_from_browser and not (effective_cookies and _os.path.isfile(effective_cookies)):
+            cmd += ["--cookies-from-browser", cookies_from_browser]
 
         cmd.append(url)
 
