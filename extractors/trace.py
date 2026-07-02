@@ -31,6 +31,19 @@ TRACE_SESSIONS_FILE = TRACE_DIR / "sessions.json"
 TRACE_BASE = "https://go.traceup.com"
 TRACE_API = f"{TRACE_BASE}/api"
 
+# Trace's real magic-code auth API (reverse-engineered from the live SPA).
+# The flow is a clean 3-step REST sequence — no browser needed:
+#   1. GET  TRACE_USER_SEARCH?email=<email>        -> resolves the user_id
+#   2. POST TRACE_SEND_CODE  (email, email_type)   -> emails the 6-digit code
+#   3. POST TRACE_VERIFY_CODE (user_id, code)      -> sets session cookies
+# This replaces the headless-browser login, which re-submitted the email on
+# the verify step and made Trace issue a NEW code (invalidating the user's).
+TRACE_TEAMS = "https://teams.traceup.com/webapp"
+TRACE_LAPI = "https://lapi.traceup.com/tracebot-prod"
+TRACE_USER_SEARCH = f"{TRACE_LAPI}/42/users/search"
+TRACE_SEND_CODE = f"{TRACE_TEAMS}/autologin-url/send"
+TRACE_VERIFY_CODE = f"{TRACE_TEAMS}/users/login/by-code"
+
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
@@ -43,6 +56,17 @@ _HEADERS = {
     "Origin": TRACE_BASE,
     "Referer": f"{TRACE_BASE}/",
 }
+
+
+def _pending_state_path(email: str):
+    """Path to the persisted browser session (cookies + localStorage) captured
+    right after the magic code is requested. Restoring it in the verify step
+    lets us resume the SAME Trace login session and enter the code without
+    re-submitting the email — which would make Trace issue a new code and
+    invalidate the one the user already received."""
+    import hashlib
+    h = hashlib.sha256((email or "").encode("utf-8")).hexdigest()[:16]
+    return TRACE_DIR / f"pending_{h}.json"
 
 
 class TraceAuthManager:
@@ -100,50 +124,44 @@ class TraceAuthManager:
         self._save_sessions()
         return n
 
+    def _resolve_user_id(self, email: str):
+        """Resolve a Trace email to its numeric user_id via the public search
+        endpoint. Returns the int user_id or None."""
+        try:
+            r = requests.get(
+                TRACE_USER_SEARCH, params={"email": email},
+                headers=_HEADERS, timeout=15,
+            )
+            if r.status_code == 200:
+                data = (r.json() or {}).get("data") or {}
+                uid = data.get("id")
+                if uid:
+                    return int(uid)
+        except Exception:
+            pass
+        return None
+
     def request_magic_code(self, email: str) -> bool:
         """
-        Trigger Trace to send a magic code to the given email.
+        Trigger Trace to email a magic code to the given address.
 
-        Tries the Playwright browser flow first because it submits the email
-        through Trace's actual sign-in form, which is the only path that
-        reliably triggers Trace's email send pipeline. Direct REST endpoints
-        are retained as a fallback but commonly return 200 OK without firing
-        the email send.
-
-        Returns True if the request was accepted by some path.
+        Uses Trace's real send endpoint (autologin-url/send with
+        email_type=magic-code) — the exact call the Trace SPA makes. This is a
+        stateless REST POST: it sends the code without binding it to a browser
+        session, so the verify step can submit the code later without
+        regenerating it. The headless-browser flow is kept only as a fallback.
         """
-        # Primary: load the real Trace sign-in form and submit the email
+        try:
+            files = {"email": (None, email), "email_type": (None, "magic-code")}
+            r = requests.post(TRACE_SEND_CODE, files=files, headers=_HEADERS, timeout=15)
+            if r.status_code == 200 and (r.json() or {}).get("success"):
+                return True
+        except Exception:
+            pass
+
+        # Fallback: drive the real sign-in form in a browser (older path).
         if self._trigger_magic_code_via_browser(email):
             return True
-
-        # Fallback: direct REST endpoints (kept for environments where
-        # Playwright is unavailable or the browser flow times out)
-        try:
-            resp = requests.post(
-                f"{TRACE_BASE}/api/auth/magic-code",
-                json={"email": email},
-                headers=_HEADERS,
-                timeout=15,
-            )
-            if resp.status_code in (200, 201, 204):
-                return True
-
-            for endpoint in [
-                f"{TRACE_BASE}/api/auth/login",
-                f"{TRACE_BASE}/api/auth/send-code",
-                f"{TRACE_BASE}/api/users/magic-link",
-            ]:
-                resp = requests.post(
-                    endpoint,
-                    json={"email": email},
-                    headers=_HEADERS,
-                    timeout=15,
-                )
-                if resp.status_code in (200, 201, 204):
-                    return True
-
-        except Exception as e:
-            raise ExtractionError(f"Failed to request Trace magic code: {e}")
 
         return False
 
@@ -209,9 +227,28 @@ class TraceAuthManager:
                     ).first
                     submit.click()
 
+                    # Wait for the SPA to advance to the code-entry step, then
+                    # persist this session (cookies + localStorage) so the
+                    # verify step can resume it and enter the code WITHOUT
+                    # re-submitting the email. Re-submitting would make Trace
+                    # send a fresh code and invalidate the one we just emailed
+                    # — the root cause of the "new code generated after
+                    # submission / verification timed out" failures.
+                    try:
+                        page.wait_for_selector(
+                            'input[type="text"], input[type="tel"], input[type="number"]',
+                            timeout=8000,
+                        )
+                    except Exception:
+                        pass
                     # Give Trace's backend a moment to register the request
                     # and fire the send-email job before we close the browser.
                     time.sleep(3)
+                    try:
+                        TRACE_DIR.mkdir(parents=True, exist_ok=True)
+                        context.storage_state(path=str(_pending_state_path(email)))
+                    except Exception:
+                        pass
                     browser.close()
                     return True
                 except PWTimeout:
@@ -225,49 +262,58 @@ class TraceAuthManager:
 
     def submit_magic_code(self, email: str, code: str) -> dict:
         """
-        Submit the 6-digit magic code. Returns session cookies on success.
+        Verify the 6-digit magic code via Trace's real REST endpoint and return
+        the session cookies on success.
+
+        This is a stateless POST to users/login/by-code with the resolved
+        user_id + code — it does NOT re-submit the email, so it never triggers
+        a new code. That is the fix for the "a new code is generated after
+        submission / verification timed out" failure.
         """
+        user_id = self._resolve_user_id(email)
+        if not user_id:
+            raise ExtractionError(
+                f"Could not resolve a Trace account for {email}. "
+                "Check the email is correct and registered with Trace."
+            )
+
         session = requests.Session()
         session.headers.update(_HEADERS)
+        try:
+            files = {"user_id": (None, str(user_id)), "code": (None, str(code).strip())}
+            resp = session.post(TRACE_VERIFY_CODE, files=files, timeout=20)
+        except Exception as e:
+            raise ExtractionError(f"Trace verification request failed: {e}")
 
-        # Try submitting the code to various possible endpoints
-        endpoints = [
-            (f"{TRACE_BASE}/api/auth/magic-code/verify", {"email": email, "code": code}),
-            (f"{TRACE_BASE}/api/auth/verify", {"email": email, "code": code}),
-            (f"{TRACE_BASE}/api/auth/login", {"email": email, "magicCode": code}),
-            (f"{TRACE_BASE}/api/auth/callback", {"email": email, "token": code}),
-        ]
+        body = {}
+        try:
+            body = resp.json() if resp.text else {}
+        except Exception:
+            body = {}
 
-        for url, payload in endpoints:
-            try:
-                resp = session.post(url, json=payload, timeout=15)
-                if resp.status_code in (200, 201):
-                    cookies = dict(resp.cookies)
-                    if cookies:
-                        # Save session
-                        self._sessions[email] = {
-                            "cookies": cookies,
-                            "expires": time.time() + 86400 * 30,  # 30 days
-                        }
-                        self._save_sessions()
-                        return cookies
-                    # Some APIs return the token in the response body
-                    body = resp.json() if resp.text else {}
-                    token = body.get("token") or body.get("accessToken") or body.get("session")
-                    if token:
-                        cookies = {"trace_session": token}
-                        self._sessions[email] = {
-                            "cookies": cookies,
-                            "expires": time.time() + 86400 * 30,
-                        }
-                        self._save_sessions()
-                        return cookies
-            except Exception:
-                continue
+        if resp.status_code == 200 and body.get("success"):
+            # Collect session cookies. by-code authenticates the requests
+            # session; cookies are set on the .traceup.com domain and work
+            # across go/teams/lapi subdomains the extractor uses.
+            cookies = dict(session.cookies)
+            data = body.get("data") or {}
+            if isinstance(data, dict):
+                token = data.get("token") or data.get("access_token") or data.get("session")
+                if token and "token" not in cookies:
+                    cookies["token"] = token
+            if not cookies:
+                raise ExtractionError("Trace verification succeeded but no session was returned.")
+            self._sessions[email] = {
+                "cookies": cookies,
+                "expires": time.time() + 86400 * 30,  # 30 days
+            }
+            self._save_sessions()
+            return cookies
 
-        raise ExtractionError(
-            "Magic code verification failed. The code may be expired or invalid."
-        )
+        # Surface Trace's own reason (e.g. invalid_credentials / expired).
+        err = (body.get("error") or {})
+        reason = err.get("message") or err.get("id") or f"HTTP {resp.status_code}"
+        raise ExtractionError(f"Magic code verification failed: {reason}")
 
     def login_with_browser(self, email: str, code: str) -> dict:
         """
@@ -279,6 +325,30 @@ class TraceAuthManager:
         """
         return run_playwright_sync(self._login_with_browser_sync, email, code, timeout=120)
 
+    @staticmethod
+    def _find_code_inputs(page):
+        """Return a locator for the magic-code input(s) if the code-entry
+        screen is showing, else None. The code screen has no email field;
+        the email screen does — so a visible email input means we're NOT yet
+        on the code step."""
+        try:
+            if page.locator('input[type="email"]').first.is_visible(timeout=1500):
+                return None
+        except Exception:
+            pass
+        try:
+            page.wait_for_selector(
+                'input[type="tel"], input[type="number"], input[type="text"]',
+                timeout=4000,
+            )
+        except Exception:
+            return None
+        loc = page.locator('input[type="tel"], input[type="number"], input[type="text"]')
+        try:
+            return loc if loc.count() >= 1 else None
+        except Exception:
+            return None
+
     def _login_with_browser_sync(self, email: str, code: str) -> dict:
         try:
             from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -288,80 +358,95 @@ class TraceAuthManager:
                 "Install: pip install playwright && playwright install chromium"
             )
 
+        pending = _pending_state_path(email)
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
                 args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
             )
-            context = browser.new_context(
-                user_agent=_UA,
-                viewport={"width": 1280, "height": 800},
-            )
+            ctx_kwargs = dict(user_agent=_UA, viewport={"width": 1280, "height": 800})
+            # Restore the session captured when the code was requested so we
+            # resume the SAME login flow on the code-entry step.
+            if pending.exists():
+                try:
+                    ctx_kwargs["storage_state"] = str(pending)
+                except Exception:
+                    pass
+            context = browser.new_context(**ctx_kwargs)
             context.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
             )
             page = context.new_page()
 
             try:
-                # Go to login page
                 page.goto(f"{TRACE_BASE}/#/", wait_until="domcontentloaded", timeout=20000)
 
-                # Enter email
-                email_input = page.wait_for_selector(
-                    'input[type="email"], input[name="email"], input[placeholder*="email" i]',
-                    timeout=10000,
-                )
-                email_input.fill(email)
+                # Preferred path: the restored session lands us on the code step,
+                # so enter the code WITHOUT re-submitting the email (which would
+                # invalidate the user's code by issuing a new one).
+                code_inputs = self._find_code_inputs(page)
 
-                # Click sign in / submit
-                submit = page.locator(
-                    'button:has-text("Sign In"), button:has-text("Continue"), '
-                    'button:has-text("Send"), button[type="submit"]'
-                ).first
-                submit.click()
-                time.sleep(2)
+                if code_inputs is None:
+                    # Fallback: session couldn't be resumed. Re-submit the email
+                    # to reach the code screen. NOTE: this regenerates the code,
+                    # so it only works if the just-entered code matches the newly
+                    # issued one — a last resort when there's no pending session.
+                    email_input = page.wait_for_selector(
+                        'input[type="email"], input[name="email"], '
+                        'input[placeholder*="email" i]',
+                        timeout=10000,
+                    )
+                    email_input.fill(email)
+                    page.locator(
+                        'button:has-text("Sign In"), button:has-text("Continue"), '
+                        'button:has-text("Send"), button[type="submit"]'
+                    ).first.click()
+                    time.sleep(2)
+                    code_inputs = self._find_code_inputs(page)
 
-                # Enter magic code
-                # Trace shows 6 individual input boxes for the code
-                code_inputs = page.locator('input[type="text"], input[type="number"], input[type="tel"]')
+                if code_inputs is None:
+                    raise ExtractionError(
+                        "Could not reach the Trace code-entry screen. "
+                        "Request a fresh code and try again."
+                    )
+
                 count = code_inputs.count()
-
                 if count >= 6:
-                    # Individual digit inputs
                     for i, digit in enumerate(code[:6]):
                         code_inputs.nth(i).fill(digit)
                         time.sleep(0.1)
                 elif count >= 1:
-                    # Single input field
                     code_inputs.first.fill(code)
 
                 time.sleep(1)
 
-                # Click sign in
                 try:
-                    sign_in = page.locator(
+                    page.locator(
                         'button:has-text("Sign In"), button:has-text("Verify"), '
                         'button[type="submit"]'
-                    ).first
-                    sign_in.click()
+                    ).first.click()
                 except Exception:
                     pass
 
-                # Wait for redirect (successful login)
                 page.wait_for_function(
                     "() => window.location.href.includes('/traceid/') || "
                     "window.location.href.includes('/home')",
                     timeout=15000,
                 )
 
-                # Capture cookies
                 pw_cookies = context.cookies()
-                cookies = {}
-                for c in pw_cookies:
-                    if "traceup.com" in c.get("domain", ""):
-                        cookies[c["name"]] = c["value"]
+                cookies = {
+                    c["name"]: c["value"]
+                    for c in pw_cookies
+                    if "traceup.com" in c.get("domain", "")
+                }
 
                 browser.close()
+                # Single-use pending session — remove it now that we're done.
+                try:
+                    pending.unlink()
+                except Exception:
+                    pass
 
                 if cookies:
                     self._sessions[email] = {
@@ -375,7 +460,13 @@ class TraceAuthManager:
 
             except PWTimeout:
                 browser.close()
-                raise ExtractionError("Trace login timed out — check the magic code")
+                raise ExtractionError(
+                    "Trace login timed out — the code may be expired. "
+                    "Request a fresh code and try again."
+                )
+            except ExtractionError:
+                browser.close()
+                raise
             except Exception as e:
                 browser.close()
                 raise ExtractionError(f"Trace browser login failed: {e}")
