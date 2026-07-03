@@ -471,19 +471,21 @@ async def verify_magic_code(req: VerifyRequest):
     if not job:
         raise HTTPException(404, f"Job {req.job_id} not found")
 
-    # Try API-based verification first, then browser fallback
+    # Verify via Trace's real REST endpoint (users/login/by-code). This is a
+    # stateless POST of user_id + code, so it never re-submits the email and
+    # never regenerates the code. We intentionally do NOT fall back to the
+    # browser login here — that path re-submits the email and would issue a
+    # fresh code, invalidating the one the user just entered (the root cause of
+    # the "new code generated after submission" verification failures).
     cookies = None
     try:
         cookies = trace_auth.submit_magic_code(email, req.magic_code)
-    except Exception:
-        try:
-            cookies = trace_auth.login_with_browser(email, req.magic_code)
-        except Exception as e:
-            job["status"] = "error"
-            job["error"] = f"Magic code verification failed: {e}"
-            return ImportResponse(
-                job_id=req.job_id, status="error", message=str(e),
-            )
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = f"Magic code verification failed: {e}"
+        return ImportResponse(
+            job_id=req.job_id, status="error", message=str(e),
+        )
 
     if not cookies:
         job["status"] = "error"
@@ -493,9 +495,12 @@ async def verify_magic_code(req: VerifyRequest):
             message="Magic code verification failed — try again",
         )
 
-    # Success — start the download
+    # Success — start the download. Clear any error left by a previous failed
+    # verify attempt so the status endpoint doesn't keep showing a stale
+    # "verification failed" after a later attempt has actually succeeded.
     del pending_verifications[req.job_id]
     job["status"] = "queued"
+    job["error"] = None
     job["updated_at"] = time.time()
 
     executor.submit(_process_job, req.job_id, cookies=cookies)
@@ -543,6 +548,9 @@ def _process_job(job_id: str, cookies: dict = None, session_token: str = None):
     log.info(f"[{job_id}] Starting {job['platform'].upper()} download: {url[:80]}")
 
     # ── Extract ───────────────────────────────────────────────────────
+    # Clear any error carried over from a prior attempt so this run reports
+    # its own outcome, never a stale message.
+    job["error"] = None
     job["status"] = "extracting"
     job["updated_at"] = time.time()
 
