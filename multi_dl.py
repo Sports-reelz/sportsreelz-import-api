@@ -91,21 +91,27 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
         #   1. Try MP4/M4A (cleanest, no transcode on merge)
         #   2. Try any video+audio at that height
         #   3. Try any best single-file at that height
+        # Terminal fallback "b" (yt-dlp shorthand for "best, no filters at
+        # all") is appended to every tier below. This exists specifically for
+        # the "Requested format is not available" failure mode: a video whose
+        # extracted format list is thin/unusual enough that even an unfiltered
+        # best[height<=N] finds nothing. "b" has no height/ext constraint, so
+        # it only fails if the format list is genuinely empty.
         if quality == "720p":
             fmt = ("bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
                    "bestvideo[height<=720]+bestaudio/"
-                   "best[height<=720]/best")
+                   "best[height<=720]/best/b")
         elif quality == "480p":
             fmt = ("bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
                    "bestvideo[height<=480]+bestaudio/"
-                   "best[height<=480]/best")
+                   "best[height<=480]/best/b")
         elif quality == "1080p":
             fmt = ("bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
                    "bestvideo[height<=1080]+bestaudio/"
-                   "best[height<=1080]/best")
+                   "best[height<=1080]/best/b")
         else:
             fmt = ("bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                   "bestvideo+bestaudio/best")
+                   "bestvideo+bestaudio/best/b")
     else:
         # No FFmpeg available — must use pre-merged single-file formats.
         # YouTube caps pre-merged at 720p so 1080p falls back to 720p.
@@ -185,13 +191,21 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
     #   3. YOUTUBE_COOKIES_FILE env var (legacy name, same behavior)
     #   4. YT_DLP_COOKIES_FROM_BROWSER env var (e.g. "chrome", "firefox") —
     #      uses Playwright/yt-dlp browser-cookie extraction on the host
-    effective_cookies = cookies_path or os.environ.get("YT_DLP_COOKIES_FILE") \
-        or os.environ.get("YOUTUBE_COOKIES_FILE")
+    # Per-request cookies (cookies_path) always apply — the caller passed them
+    # deliberately for this specific download. Env-based YouTube cookies, by
+    # contrast, apply ONLY to YouTube: sending them to VEO/Pixellot/Trace is
+    # wrong, and — because yt-dlp rewrites the cookie file at the end of the
+    # session — it crashes those non-YouTube downloads with exit 1 at 100%
+    # whenever the cookies file is mounted read-only (the common Docker setup).
+    effective_cookies = cookies_path
+    if is_youtube and not effective_cookies:
+        effective_cookies = (os.environ.get("YT_DLP_COOKIES_FILE")
+                             or os.environ.get("YOUTUBE_COOKIES_FILE"))
     if effective_cookies and os.path.isfile(effective_cookies):
         cmd += ["--cookies", effective_cookies]
 
     cookies_from_browser = os.environ.get("YT_DLP_COOKIES_FROM_BROWSER")
-    if cookies_from_browser and not effective_cookies:
+    if is_youtube and cookies_from_browser and not effective_cookies:
         cmd += ["--cookies-from-browser", cookies_from_browser]
 
     # Add source-specific headers
@@ -301,6 +315,61 @@ def download_with_ytdlp(result: ExtractResult, output_path: str,
                     f"yt-dlp exited with code {proc.returncode}"
                     + (f": {detail}" if detail else "")
                 )
+
+                # Self-diagnosis: "Requested format is not available" means our
+                # selector matched nothing against whatever format list this
+                # specific environment/request actually got back from YouTube.
+                # That list can differ from what the same video shows when
+                # tested from another machine/IP/session, so guessing from a
+                # local repro is unreliable. Capture --list-formats right here,
+                # in the exact failing environment, and fold a compact summary
+                # into the error so the next occurrence is diagnosable from the
+                # API response alone — no more multi-day round trips to get a
+                # DevTools/format capture from someone else's machine.
+                if "Requested format is not available" in detail and is_youtube:
+                    try:
+                        list_cmd = [
+                            sys.executable, "-m", "yt_dlp", "--no-warnings",
+                            "--list-formats", "--skip-download",
+                        ]
+                        # Reuse the same extractor-args / cookies context so the
+                        # capture reflects exactly what the failed attempt saw.
+                        for i, arg in enumerate(cmd):
+                            if arg in ("--extractor-args", "--cookies",
+                                       "--cookies-from-browser", "--add-header"):
+                                list_cmd += [arg, cmd[i + 1]]
+                        list_cmd.append(result.source_url or result.direct_url)
+                        # This runs AFTER the download already failed, purely
+                        # to enrich the error message — it's not on the hot
+                        # path, so a generous timeout is safe. Querying 5
+                        # player clients (the default YT_DLP_PLAYER_CLIENT
+                        # list) has been observed to take close to 30s.
+                        lf = subprocess.run(
+                            list_cmd, capture_output=True, text=True,
+                            timeout=45,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                        raw_lines = [
+                            ln for ln in (lf.stdout or lf.stderr or "").splitlines()
+                            if ln.strip()
+                        ]
+                        # Real format-table rows all contain a "|" column
+                        # separator; yt-dlp's own log lines ("[youtube] ...",
+                        # "[info] ...") never do. This reliably isolates the
+                        # table without matching yt-dlp's log preamble.
+                        table = [
+                            _redact_sensitive(ln) for ln in raw_lines
+                            if "|" in ln and not ln.startswith("[")
+                        ]
+                        if table:
+                            progress.error += (
+                                " | available formats at failure time: "
+                                + " ~ ".join(table[:15])
+                            )[:1800]
+                    except Exception:
+                        # Diagnosis is best-effort; never let it mask the
+                        # original error or crash the download path.
+                        pass
 
     except FileNotFoundError:
         progress.status = "error"
