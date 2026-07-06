@@ -448,6 +448,30 @@ async def start_import(req: ImportRequest):
             job_id=job_id, status="queued", message="Download started",
         )
 
+    # ── PIXELLOT: email + password (you.pixellot.tv account login) ────
+    if platform == "pixellot":
+        cookies = None
+        if req.platform_email and req.platform_password:
+            try:
+                from extractors.pixellot import PixellotAuthManager
+                pm = PixellotAuthManager()
+                cookies = pm.get_session(req.platform_email)
+                if not cookies:
+                    cookies = pm.login_with_browser(
+                        req.platform_email, req.platform_password
+                    )
+            except Exception as e:
+                job["status"] = "error"
+                job["error"] = f"PIXELLOT login failed: {e}"
+                return ImportResponse(
+                    job_id=job_id, status="error", message=str(e),
+                )
+
+        executor.submit(_process_job, job_id, cookies=cookies)
+        return ImportResponse(
+            job_id=job_id, status="queued", message="Download started",
+        )
+
     # ── Other platforms ───────────────────────────────────────────────
     executor.submit(_process_job, job_id)
     return ImportResponse(
