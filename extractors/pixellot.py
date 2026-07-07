@@ -114,23 +114,58 @@ class PixellotAuthManager:
         gives no visible error text on failed login, so URL/DOM state alone
         isn't a reliable success signal).
 
+        Retries once with a fresh browser context before giving up — a
+        Firebase-auth SPA redirect + resource reload has more timing
+        variance under real network conditions (container/cloud egress)
+        than it showed in local testing, and a transient hiccup on attempt
+        one shouldn't cost the caller a full failed job.
+
         Dispatched to a fresh worker thread via run_playwright_sync because
         the sync Playwright API cannot run inside an asyncio event loop.
         """
-        cookies = run_playwright_sync(
-            self._login_with_browser_sync, email, password, timeout=60,
-        )
-        if cookies:
-            self._sessions[email] = {"cookies": cookies, "cached_at": time.time()}
-            self._save_sessions()
-            return cookies
+        last_wrong_password = False
+        for attempt in range(2):
+            cookies, wrong_password = run_playwright_sync(
+                self._login_with_browser_sync, email, password, timeout=60,
+            )
+            if cookies:
+                self._sessions[email] = {"cookies": cookies, "cached_at": time.time()}
+                self._save_sessions()
+                return cookies
+            last_wrong_password = wrong_password
+            if wrong_password:
+                break  # a real "wrong password" signal — retrying won't help
+
+        if last_wrong_password:
+            raise ExtractionError(
+                "PIXELLOT rejected the email/password for this "
+                "you.pixellot.tv account. Double-check the credentials are "
+                "for a you.pixellot.tv account specifically (not a Pixellot "
+                "Partner/API account, which uses a different login system)."
+            )
+        # We could NOT confirm the credentials were wrong — the page never
+        # reached a state we could read either way. Do not tell the caller
+        # to "check credentials" here; that was the exact misleading message
+        # that cost days of debugging on HUDL's "session may be expired"
+        # error before we traced it to a completely different root cause.
         raise ExtractionError(
-            "PIXELLOT login failed — check the email/password are correct "
-            "for a you.pixellot.tv account (not a Pixellot Partner/API "
-            "account, which uses a different login system)."
+            "PIXELLOT login did not complete within the timeout (tried "
+            "twice). This is NOT a confirmed credentials problem — the "
+            "login form was submitted but the post-login confirmation "
+            "never arrived in time. Likely causes: Pixellot's own "
+            "anti-automation throttling on this account/IP after repeated "
+            "recent attempts, or slower network latency from this server "
+            "to Pixellot than in local testing. Wait a few minutes and "
+            "retry; if it persists, try a different Pixellot account to "
+            "rule out account-specific throttling."
         )
 
-    def _login_with_browser_sync(self, email: str, password: str) -> dict:
+    def _login_with_browser_sync(self, email: str, password: str):
+        """Returns (cookies_dict, wrong_password_bool). cookies_dict is {}
+        on any failure; wrong_password_bool is only True when the page
+        gives an explicit, unambiguous "incorrect password/email" signal —
+        everything else (timeout, no signal either way) leaves it False so
+        the caller doesn't misreport an inconclusive result as bad creds."""
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
         with sync_playwright() as p:
@@ -154,6 +189,7 @@ class PixellotAuthManager:
 
             page.on("response", _on_response)
 
+            wrong_password = False
             try:
                 page.goto(PIXELLOT_LOGIN_PAGE, wait_until="domcontentloaded", timeout=25000)
                 # The login page is a Nuxt/Vue SPA — at "domcontentloaded" the
@@ -177,19 +213,38 @@ class PixellotAuthManager:
                 deadline = time.time() + 35
                 while not me_ok["value"] and time.time() < deadline:
                     time.sleep(0.3)
+                    # An explicit wrong-password/wrong-email error is the one
+                    # case where retrying is pointless. This exact wording
+                    # hasn't been directly observed (testing only used valid
+                    # credentials), so this is a best-effort heuristic over
+                    # common phrasing — deliberately narrow, so an unrelated
+                    # page string can't cause a false "wrong password" verdict
+                    # that skips the retry.
+                    if not me_ok["value"]:
+                        try:
+                            body_text = page.locator("body").inner_text().lower()
+                            if any(p in body_text for p in (
+                                "incorrect password", "invalid password",
+                                "invalid email or password", "wrong password",
+                                "user not found", "no account found",
+                            )):
+                                wrong_password = True
+                                break
+                        except Exception:
+                            pass
 
                 # Capture cookies BEFORE closing the browser — the context
                 # (and its cookie jar) is destroyed once the browser closes.
                 cookies = ({c["name"]: c["value"] for c in context.cookies()}
                            if me_ok["value"] else {})
             except PWTimeout:
-                raise ExtractionError("PIXELLOT login timed out loading the sign-in page")
-            except Exception as e:
-                raise ExtractionError(f"PIXELLOT browser login failed: {e}")
+                cookies = {}
+            except Exception:
+                cookies = {}
             finally:
                 browser.close()
 
-            return cookies
+            return cookies, wrong_password
 
 
 class PixellotExtractor(BaseExtractor):
