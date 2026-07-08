@@ -1,26 +1,250 @@
 """
-PIXELLOT extractor (pixellot.tv / community.pixellot.tv).
+PIXELLOT extractor (you.pixellot.tv / you.pixellot.link).
 
-PIXELLOT uses:
-  - JWT authentication (login → get token → use token on API)
-  - HLS streaming (m3u8)
-  - IFrame-based embed player at pixellot-web-sdk.pixellot.tv
+Reverse-engineered from the live you.pixellot.tv site: account login is
+Firebase Authentication (client-side), and the authenticated backend is
+you.pixellot.tv/api/v1/* — NOT api.pixellot.tv/v1 (that's a different
+Pixellot product's API and returns "invalid username or password" for
+You accounts regardless of credential validity).
 
-Status: AWAITING JWT token + API endpoint capture from client.
-To complete: need Partner API credentials or browser Network capture
-showing the m3u8 URL and Authorization header pattern.
+Since there's no plain REST login endpoint (auth happens via the Firebase
+JS SDK in the browser), PixellotAuthManager drives the real login form
+with Playwright and captures the resulting session cookies — the same
+approach used for HUDL/Trace.
 """
 
 import re
 import json
 import time
+from pathlib import Path
 import requests
 from urllib.parse import urlparse, parse_qs
 
 from .base import BaseExtractor, ExtractResult, ExtractionError, AuthRequiredError, run_playwright_sync
 
+PIXELLOT_YOU_BASE = "https://you.pixellot.tv"
+PIXELLOT_LOGIN_PAGE = f"{PIXELLOT_YOU_BASE}/my/login/"
+PIXELLOT_ME_ENDPOINT = f"{PIXELLOT_YOU_BASE}/api/v1/users/me"
+
+# Legacy/unused: api.pixellot.tv is a different Pixellot product's API and
+# does not accept you.pixellot.tv account credentials. Kept only so any
+# external reference to these names doesn't hard-fail on import.
 PIXELLOT_API_BASE = "https://api.pixellot.tv/v1"
 PIXELLOT_LOGIN = f"{PIXELLOT_API_BASE}/login"
+
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+)
+
+
+# ── Pixellot Auth Manager ─────────────────────────────────────────────────────
+
+PIXELLOT_DIR = Path.home() / ".pixellot"
+PIXELLOT_SESSIONS_FILE = PIXELLOT_DIR / "sessions.json"
+
+
+class PixellotAuthManager:
+    """
+    Manages you.pixellot.tv account login (email + password -> session cookies).
+
+    Pixellot You's session lifetime isn't documented, so rather than caching
+    blindly for a fixed window (the mistake that caused the Trace regeneration
+    bug), a cached session is always re-validated with one cheap GET to
+    /api/v1/users/me before reuse. Only a real 200 counts as valid.
+    """
+
+    def __init__(self):
+        PIXELLOT_DIR.mkdir(parents=True, exist_ok=True)
+        self._sessions = self._load_sessions()
+
+    def _load_sessions(self) -> dict:
+        if PIXELLOT_SESSIONS_FILE.exists():
+            try:
+                return json.loads(PIXELLOT_SESSIONS_FILE.read_text())
+            except Exception:
+                pass
+        return {}
+
+    def _save_sessions(self):
+        PIXELLOT_SESSIONS_FILE.write_text(json.dumps(self._sessions, indent=2))
+
+    def _cookies_still_valid(self, cookies: dict) -> bool:
+        """One cheap GET against a real authenticated endpoint. This is the
+        only reliable way to know a Pixellot session is still good — there's
+        no documented expiry to check locally."""
+        if not cookies:
+            return False
+        try:
+            r = requests.get(
+                PIXELLOT_ME_ENDPOINT,
+                headers={"User-Agent": _UA, "Accept": "application/json"},
+                cookies=cookies,
+                timeout=10,
+            )
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def get_session(self, email: str) -> dict | None:
+        """Return cached cookies for this email if they still validate live,
+        else drop the stale entry and return None."""
+        entry = self._sessions.get(email)
+        if not entry:
+            return None
+        cookies = entry.get("cookies") or {}
+        if self._cookies_still_valid(cookies):
+            return cookies
+        del self._sessions[email]
+        self._save_sessions()
+        return None
+
+    def clear_session(self, email: str) -> bool:
+        if email in self._sessions:
+            del self._sessions[email]
+            self._save_sessions()
+            return True
+        return False
+
+    def login_with_browser(self, email: str, password: str) -> dict:
+        """
+        Log into you.pixellot.tv/my/login/ with Playwright and capture the
+        resulting session cookies. Confirms success via a live
+        /api/v1/users/me check inside the same browser session (the site
+        gives no visible error text on failed login, so URL/DOM state alone
+        isn't a reliable success signal).
+
+        Retries once with a fresh browser context before giving up — a
+        Firebase-auth SPA redirect + resource reload has more timing
+        variance under real network conditions (container/cloud egress)
+        than it showed in local testing, and a transient hiccup on attempt
+        one shouldn't cost the caller a full failed job.
+
+        Dispatched to a fresh worker thread via run_playwright_sync because
+        the sync Playwright API cannot run inside an asyncio event loop.
+        """
+        last_wrong_password = False
+        for attempt in range(2):
+            cookies, wrong_password = run_playwright_sync(
+                self._login_with_browser_sync, email, password, timeout=60,
+            )
+            if cookies:
+                self._sessions[email] = {"cookies": cookies, "cached_at": time.time()}
+                self._save_sessions()
+                return cookies
+            last_wrong_password = wrong_password
+            if wrong_password:
+                break  # a real "wrong password" signal — retrying won't help
+
+        if last_wrong_password:
+            raise ExtractionError(
+                "PIXELLOT rejected the email/password for this "
+                "you.pixellot.tv account. Double-check the credentials are "
+                "for a you.pixellot.tv account specifically (not a Pixellot "
+                "Partner/API account, which uses a different login system)."
+            )
+        # We could NOT confirm the credentials were wrong — the page never
+        # reached a state we could read either way. Do not tell the caller
+        # to "check credentials" here; that was the exact misleading message
+        # that cost days of debugging on HUDL's "session may be expired"
+        # error before we traced it to a completely different root cause.
+        raise ExtractionError(
+            "PIXELLOT login did not complete within the timeout (tried "
+            "twice). This is NOT a confirmed credentials problem — the "
+            "login form was submitted but the post-login confirmation "
+            "never arrived in time. Likely causes: Pixellot's own "
+            "anti-automation throttling on this account/IP after repeated "
+            "recent attempts, or slower network latency from this server "
+            "to Pixellot than in local testing. Wait a few minutes and "
+            "retry; if it persists, try a different Pixellot account to "
+            "rule out account-specific throttling."
+        )
+
+    def _login_with_browser_sync(self, email: str, password: str):
+        """Returns (cookies_dict, wrong_password_bool). cookies_dict is {}
+        on any failure; wrong_password_bool is only True when the page
+        gives an explicit, unambiguous "incorrect password/email" signal —
+        everything else (timeout, no signal either way) leaves it False so
+        the caller doesn't misreport an inconclusive result as bad creds."""
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            )
+            context = browser.new_context(
+                user_agent=_UA, viewport={"width": 1280, "height": 800},
+            )
+            context.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+            )
+            page = context.new_page()
+
+            me_ok = {"value": False}
+
+            def _on_response(resp):
+                if resp.url.startswith(PIXELLOT_ME_ENDPOINT) and resp.status == 200:
+                    me_ok["value"] = True
+
+            page.on("response", _on_response)
+
+            wrong_password = False
+            try:
+                page.goto(PIXELLOT_LOGIN_PAGE, wait_until="domcontentloaded", timeout=25000)
+                # The login page is a Nuxt/Vue SPA — at "domcontentloaded" the
+                # server-rendered HTML (including #email/#password) is present,
+                # but Vue's client-side event handlers may not be bound yet.
+                # Clicking LOG IN too early is a silent no-op (no error, no
+                # network request, nothing) rather than a visible failure —
+                # this is what caused the first version of this method to
+                # fail 100% of the time despite identical selectors to a
+                # manual test that included this wait.
+                page.wait_for_timeout(2000)
+                page.fill("#email", email)
+                page.fill("#password", password)
+                page.locator('button:has-text("LOG IN")').first.click()
+
+                # After a successful login the SPA does a full client-side
+                # redirect to /my/profile/ and reloads a batch of JS/CSS/image
+                # chunks before it finally calls /api/v1/users/me — observed
+                # to take noticeably longer than a bare form submit under
+                # headless/cold-start conditions. 35s gives real margin.
+                deadline = time.time() + 35
+                while not me_ok["value"] and time.time() < deadline:
+                    time.sleep(0.3)
+                    # An explicit wrong-password/wrong-email error is the one
+                    # case where retrying is pointless. This exact wording
+                    # hasn't been directly observed (testing only used valid
+                    # credentials), so this is a best-effort heuristic over
+                    # common phrasing — deliberately narrow, so an unrelated
+                    # page string can't cause a false "wrong password" verdict
+                    # that skips the retry.
+                    if not me_ok["value"]:
+                        try:
+                            body_text = page.locator("body").inner_text().lower()
+                            if any(p in body_text for p in (
+                                "incorrect password", "invalid password",
+                                "invalid email or password", "wrong password",
+                                "user not found", "no account found",
+                            )):
+                                wrong_password = True
+                                break
+                        except Exception:
+                            pass
+
+                # Capture cookies BEFORE closing the browser — the context
+                # (and its cookie jar) is destroyed once the browser closes.
+                cookies = ({c["name"]: c["value"] for c in context.cookies()}
+                           if me_ok["value"] else {})
+            except PWTimeout:
+                cookies = {}
+            except Exception:
+                cookies = {}
+            finally:
+                browser.close()
+
+            return cookies, wrong_password
 
 
 class PixellotExtractor(BaseExtractor):
@@ -213,16 +437,27 @@ class PixellotExtractor(BaseExtractor):
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
             )
 
-            # Attach existing cookies if the caller provided them
+            # Attach existing cookies if the caller provided them. Pixellot's
+            # session cookies were observed to come from you.pixellot.tv
+            # specifically (a Nuxt app), which may or may not be scoped to
+            # the parent .pixellot.tv domain — set for both so it lands
+            # regardless of how strictly the original cookie was scoped.
             if isinstance(cookies, dict):
                 pw_cookies = []
                 for name, value in cookies.items():
                     pw_cookies.append({
                         "name": name, "value": value,
+                        "domain": "you.pixellot.tv", "path": "/",
+                    })
+                    pw_cookies.append({
+                        "name": name, "value": value,
                         "domain": ".pixellot.tv", "path": "/",
                     })
                 if pw_cookies:
-                    context.add_cookies(pw_cookies)
+                    try:
+                        context.add_cookies(pw_cookies)
+                    except Exception:
+                        pass
 
             page = context.new_page()
             page.on("request", _on_request)
