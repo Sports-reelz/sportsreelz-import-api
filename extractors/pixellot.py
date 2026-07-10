@@ -9,8 +9,12 @@ You accounts regardless of credential validity).
 
 Since there's no plain REST login endpoint (auth happens via the Firebase
 JS SDK in the browser), PixellotAuthManager drives the real login form
-with Playwright and captures the resulting session cookies — the same
-approach used for HUDL/Trace.
+with Playwright and captures the resulting session — the same browser-driven
+approach used for HUDL/Trace, except the session that has to be persisted
+and replayed is a full storage_state (cookies + localStorage), not just
+cookies: Pixellot's real auth is a `firebase:authUser:...` entry in
+localStorage, confirmed live (cookies alone 401 on /api/v1/users/me within
+seconds of a proven-successful login).
 """
 
 import re
@@ -18,19 +22,13 @@ import json
 import time
 from pathlib import Path
 import requests
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 from .base import BaseExtractor, ExtractResult, ExtractionError, AuthRequiredError, run_playwright_sync
 
 PIXELLOT_YOU_BASE = "https://you.pixellot.tv"
 PIXELLOT_LOGIN_PAGE = f"{PIXELLOT_YOU_BASE}/my/login/"
 PIXELLOT_ME_ENDPOINT = f"{PIXELLOT_YOU_BASE}/api/v1/users/me"
-
-# Legacy/unused: api.pixellot.tv is a different Pixellot product's API and
-# does not accept you.pixellot.tv account credentials. Kept only so any
-# external reference to these names doesn't hard-fail on import.
-PIXELLOT_API_BASE = "https://api.pixellot.tv/v1"
-PIXELLOT_LOGIN = f"{PIXELLOT_API_BASE}/login"
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -46,12 +44,18 @@ PIXELLOT_SESSIONS_FILE = PIXELLOT_DIR / "sessions.json"
 
 class PixellotAuthManager:
     """
-    Manages you.pixellot.tv account login (email + password -> session cookies).
+    Manages you.pixellot.tv account login (email + password -> session state).
 
-    Pixellot You's session lifetime isn't documented, so rather than caching
-    blindly for a fixed window (the mistake that caused the Trace regeneration
-    bug), a cached session is always re-validated with one cheap GET to
-    /api/v1/users/me before reuse. Only a real 200 counts as valid.
+    Pixellot's real session is Firebase Auth's client-side persistence (a
+    `firebase:authUser:<apiKey>:[DEFAULT]` entry in localStorage) — NOT a
+    cookie. Confirmed live: cookies captured right after a successful login
+    (Stripe/GA/Hotjar/Zendesk-style tracking cookies, nothing auth-shaped)
+    get a 401 from /api/v1/users/me seconds later when replayed with plain
+    `requests`, while a Playwright storage_state carrying that localStorage
+    key authenticates immediately with no re-login. So the cached/reused
+    session object here is a full Playwright storage_state (cookies +
+    localStorage), and it can only be validated by actually loading it into
+    a browser — a plain HTTP request can't replay localStorage-driven auth.
     """
 
     def __init__(self):
@@ -69,32 +73,51 @@ class PixellotAuthManager:
     def _save_sessions(self):
         PIXELLOT_SESSIONS_FILE.write_text(json.dumps(self._sessions, indent=2))
 
-    def _cookies_still_valid(self, cookies: dict) -> bool:
-        """One cheap GET against a real authenticated endpoint. This is the
-        only reliable way to know a Pixellot session is still good — there's
-        no documented expiry to check locally."""
-        if not cookies:
+    def _session_still_valid(self, storage_state: dict) -> bool:
+        """Load the storage_state into a real browser and check the SPA's
+        own auth call. There's no documented expiry to check locally, and no
+        way to check from plain HTTP (see class docstring)."""
+        if not storage_state:
             return False
         try:
-            r = requests.get(
-                PIXELLOT_ME_ENDPOINT,
-                headers={"User-Agent": _UA, "Accept": "application/json"},
-                cookies=cookies,
-                timeout=10,
-            )
-            return r.status_code == 200
+            return bool(run_playwright_sync(self._check_session_sync, storage_state, timeout=30))
         except Exception:
             return False
 
+    def _check_session_sync(self, storage_state: dict) -> bool:
+        from playwright.sync_api import sync_playwright
+
+        me_ok = {"v": False}
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            context = browser.new_context(user_agent=_UA, storage_state=storage_state)
+            page = context.new_page()
+
+            def _on_response(resp):
+                if "api/v1/users/me" in resp.url and resp.status == 200:
+                    me_ok["v"] = True
+
+            page.on("response", _on_response)
+            try:
+                page.goto(PIXELLOT_LOGIN_PAGE, wait_until="domcontentloaded", timeout=15000)
+                deadline = time.time() + 10
+                while not me_ok["v"] and time.time() < deadline:
+                    page.wait_for_timeout(300)
+            except Exception:
+                pass
+            finally:
+                browser.close()
+        return me_ok["v"]
+
     def get_session(self, email: str) -> dict | None:
-        """Return cached cookies for this email if they still validate live,
-        else drop the stale entry and return None."""
+        """Return a cached storage_state for this email if it still
+        validates live, else drop the stale entry and return None."""
         entry = self._sessions.get(email)
         if not entry:
             return None
-        cookies = entry.get("cookies") or {}
-        if self._cookies_still_valid(cookies):
-            return cookies
+        storage_state = entry.get("storage_state")
+        if storage_state and self._session_still_valid(storage_state):
+            return storage_state
         del self._sessions[email]
         self._save_sessions()
         return None
@@ -109,10 +132,11 @@ class PixellotAuthManager:
     def login_with_browser(self, email: str, password: str) -> dict:
         """
         Log into you.pixellot.tv/my/login/ with Playwright and capture the
-        resulting session cookies. Confirms success via a live
-        /api/v1/users/me check inside the same browser session (the site
-        gives no visible error text on failed login, so URL/DOM state alone
-        isn't a reliable success signal).
+        resulting storage_state (cookies + localStorage — see class
+        docstring for why localStorage is the part that actually matters).
+        Confirms success via a live /api/v1/users/me check inside the same
+        browser session (the site gives no visible error text on failed
+        login, so URL/DOM state alone isn't a reliable success signal).
 
         Retries once with a fresh browser context before giving up — a
         Firebase-auth SPA redirect + resource reload has more timing
@@ -125,13 +149,13 @@ class PixellotAuthManager:
         """
         last_wrong_password = False
         for attempt in range(2):
-            cookies, wrong_password = run_playwright_sync(
+            storage_state, wrong_password = run_playwright_sync(
                 self._login_with_browser_sync, email, password, timeout=60,
             )
-            if cookies:
-                self._sessions[email] = {"cookies": cookies, "cached_at": time.time()}
+            if storage_state:
+                self._sessions[email] = {"storage_state": storage_state, "cached_at": time.time()}
                 self._save_sessions()
-                return cookies
+                return storage_state
             last_wrong_password = wrong_password
             if wrong_password:
                 break  # a real "wrong password" signal — retrying won't help
@@ -161,8 +185,8 @@ class PixellotAuthManager:
         )
 
     def _login_with_browser_sync(self, email: str, password: str):
-        """Returns (cookies_dict, wrong_password_bool). cookies_dict is {}
-        on any failure; wrong_password_bool is only True when the page
+        """Returns (storage_state, wrong_password_bool). storage_state is
+        None on any failure; wrong_password_bool is only True when the page
         gives an explicit, unambiguous "incorrect password/email" signal —
         everything else (timeout, no signal either way) leaves it False so
         the caller doesn't misreport an inconclusive result as bad creds."""
@@ -233,18 +257,23 @@ class PixellotAuthManager:
                         except Exception:
                             pass
 
-                # Capture cookies BEFORE closing the browser — the context
-                # (and its cookie jar) is destroyed once the browser closes.
-                cookies = ({c["name"]: c["value"] for c in context.cookies()}
-                           if me_ok["value"] else {})
+                # Capture the FULL storage_state (cookies + localStorage)
+                # BEFORE closing the browser — the context (and its storage)
+                # is destroyed once the browser closes. Cookies alone are
+                # not enough: Pixellot's real session is the
+                # firebase:authUser:... entry in localStorage, confirmed
+                # live (see class docstring) — a cookies-only capture 401s
+                # on /api/v1/users/me within seconds when replayed outside
+                # the browser that captured it.
+                storage_state = context.storage_state() if me_ok["value"] else None
             except PWTimeout:
-                cookies = {}
+                storage_state = None
             except Exception:
-                cookies = {}
+                storage_state = None
             finally:
                 browser.close()
 
-            return cookies, wrong_password
+            return storage_state, wrong_password
 
 
 class PixellotExtractor(BaseExtractor):
@@ -261,13 +290,28 @@ class PixellotExtractor(BaseExtractor):
         Extract PIXELLOT video.
 
         Handles three URL families:
-          - https://you.pixellot.link/<short>           (short link → 302 redirect)
+          - https://you.pixellot.link/<short>           (Branch.io share link)
           - https://you.pixellot.tv/my/events/view/?id=<id>&type=event
           - https://www.pixellot.tv/{events,games}/<id>
 
         session_token: JWT bearer token from Pixellot API login.
-        cookies: alternatively, browser session cookies.
+        cookies: alternatively, a Playwright storage_state dict from
+          PixellotAuthManager (cookies + localStorage — see that class's
+          docstring for why localStorage is required), or a flat
+          name->value cookie dict.
         """
+        # PixellotAuthManager hands back a full Playwright storage_state
+        # (it has to — Pixellot's real session lives in a localStorage key,
+        # not a cookie, confirmed live). Pull the flat cookie view out of it
+        # for the plain-HTTP paths below, but keep the full storage_state
+        # for the Playwright fallback, which is the only path that can
+        # actually authenticate this SPA.
+        storage_state = None
+        flat_cookies = cookies
+        if isinstance(cookies, dict) and "origins" in cookies and "cookies" in cookies:
+            storage_state = cookies
+            flat_cookies = {c["name"]: c["value"] for c in storage_state.get("cookies", [])}
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
@@ -278,88 +322,65 @@ class PixellotExtractor(BaseExtractor):
         if session_token:
             headers["Authorization"] = f"Bearer {session_token}"
 
-        if cookies:
-            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        if flat_cookies:
+            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in flat_cookies.items())
 
-        # Resolve short links — you.pixellot.link/<short> returns 302 to the
-        # real events view URL. Follow the redirect once so the rest of the
-        # extractor sees the resolved URL.
+        # NOTE: pixellot.link share links are intentionally NOT pre-resolved
+        # here. They route through Branch.io (app.link), whose desktop-web
+        # redirect is JS-driven and carries a one-time share token in the
+        # URL fragment — a plain requests.head() only follows HTTP-level
+        # redirects and stops on the Branch.io interstitial page, which has
+        # no video on it. Confirmed live: letting Playwright load the
+        # original .link URL directly follows the real redirect chain
+        # (Branch.io -> /my/events/share/?v=...&token=... -> /my/events/view/)
+        # and the player initializes correctly. So for .link URLs, skip
+        # straight to the Playwright fallback below.
         parsed = urlparse(url)
-        if "pixellot.link" in (parsed.hostname or ""):
-            try:
-                resolved = requests.head(
-                    url, headers=headers, allow_redirects=True, timeout=15
-                )
-                if resolved.url and resolved.url != url:
-                    url = resolved.url
-                    parsed = urlparse(url)
-            except Exception:
-                pass
-
-        path = parsed.path.strip("/")
+        is_share_link = "pixellot.link" in (parsed.hostname or "")
 
         # Auth is only required for the API-based extraction path. The page
         # scrape fallback can work without credentials for some public URLs,
         # so we don't gate the whole method on auth being present.
-        has_auth = bool(session_token or cookies)
+        has_auth = bool(session_token or flat_cookies)
 
-        # Try Pixellot API for stream info
-        try:
-            # Event ID can come from two places:
-            # 1. Path: /events/<id>, /games/<id>, /matches/<id>
-            # 2. Query string: ?id=<id> (used by you.pixellot.tv/my/events/view/)
-            event_id = None
-            event_match = re.search(r'(?:events?|games?|matches?)/([a-zA-Z0-9_-]+)', path)
-            if event_match:
-                event_id = event_match.group(1)
-            elif parsed.query:
-                qparams = parse_qs(parsed.query)
-                qid = qparams.get("id") or qparams.get("event_id") or qparams.get("gameId")
-                if qid:
-                    event_id = qid[0]
-
-            if event_id and has_auth:
-                api_url = f"{PIXELLOT_API_BASE}/events/{event_id}"
-                resp = requests.get(api_url, headers=headers, timeout=15)
-                if resp.ok:
-                    data = resp.json()
-                    return self._parse_pixellot_event(data, url, headers)
-        except Exception:
-            pass
-
-        # Fallback 1: scrape the page HTML for m3u8 (cheap, no browser needed)
+        # Fallback 1: scrape the page HTML for m3u8 (cheap, no browser needed).
+        # Skipped for share links — the .link URL always lands on Branch.io's
+        # interstitial, which never contains an m3u8 in its raw HTML (the
+        # real page is only reached after a JS-driven redirect chain), so
+        # this would just be a wasted request.
         page_title = None
-        try:
-            resp = requests.get(url, headers=headers, timeout=20)
-            html = resp.text
+        if not is_share_link:
+            try:
+                resp = requests.get(url, headers=headers, timeout=20)
+                html = resp.text
 
-            title_m = re.search(r"<title>([^<]+)</title>", html)
-            if title_m:
-                page_title = title_m.group(1).strip()
+                title_m = re.search(r"<title>([^<]+)</title>", html)
+                if title_m:
+                    page_title = title_m.group(1).strip()
 
-            m3u8_matches = re.findall(r'(https?://[^\s"\'\\]+\.m3u8[^\s"\'\\]*)', html)
-            if m3u8_matches:
-                m3u8_url = m3u8_matches[0].replace("\\u0026", "&").replace("\\/", "/")
-                return ExtractResult(
-                    title=_clean_title(page_title or "pixellot_game"),
-                    platform=self.PLATFORM,
-                    m3u8_url=m3u8_url,
-                    headers=headers,
-                    base_url=m3u8_url.rsplit("/", 1)[0] + "/",
-                )
-        except Exception:
-            # Don't raise here — fall through to the Playwright fallback,
-            # which can sometimes recover from network glitches the plain
-            # HTTP scrape choked on.
-            pass
+                m3u8_matches = re.findall(r'(https?://[^\s"\'\\]+\.m3u8[^\s"\'\\]*)', html)
+                if m3u8_matches:
+                    m3u8_url = m3u8_matches[0].replace("\\u0026", "&").replace("\\/", "/")
+                    return ExtractResult(
+                        title=_clean_title(page_title or "pixellot_game"),
+                        platform=self.PLATFORM,
+                        m3u8_url=m3u8_url,
+                        headers=headers,
+                        base_url=m3u8_url.rsplit("/", 1)[0] + "/",
+                    )
+            except Exception:
+                # Don't raise here — fall through to the Playwright fallback,
+                # which can sometimes recover from network glitches the plain
+                # HTTP scrape choked on.
+                pass
 
         # Fallback 2: load the page in headless Chromium and intercept the
         # m3u8 network request the player fires after JavaScript loads.
-        # Required for short-link share URLs (you.pixellot.link/<short>) where
-        # the stream URL is constructed client-side and never appears in the
-        # initial HTML.
+        # Required for share URLs (you.pixellot.link/<short>) and for any
+        # authenticated view, since the stream URL is always constructed
+        # client-side and never appears in the initial HTML.
         try:
-            result = self._extract_via_playwright(url, headers, cookies, page_title)
+            result = self._extract_via_playwright(url, headers, storage_state or flat_cookies, page_title)
             if result is not None:
                 return result
         except AuthRequiredError:
@@ -388,7 +409,7 @@ class PixellotExtractor(BaseExtractor):
     # ── Playwright fallback (public-share URL handling) ──────────────────
 
     def _extract_via_playwright(self, url: str, headers: dict,
-                                 cookies, page_title: str) -> ExtractResult:
+                                 session, page_title: str) -> ExtractResult:
         """
         Open the Pixellot URL in a headless Chromium tab, listen for the .m3u8
         network request fired by the player, and use that URL for the download.
@@ -397,16 +418,21 @@ class PixellotExtractor(BaseExtractor):
         runtime JavaScript — the m3u8 never appears in the initial HTML, so
         plain HTTP scraping always misses it.
 
+        session: a Playwright storage_state dict from PixellotAuthManager
+          (cookies + localStorage — the localStorage part is what actually
+          authenticates, see PixellotAuthManager's docstring), a flat
+          name->value cookie dict, or None.
+
         Dispatched to a fresh worker thread via run_playwright_sync because
         the sync Playwright API cannot run inside an asyncio event loop.
         """
         return run_playwright_sync(
-            self._extract_via_playwright_sync, url, headers, cookies, page_title,
+            self._extract_via_playwright_sync, url, headers, session, page_title,
             timeout=60,
         )
 
     def _extract_via_playwright_sync(self, url: str, headers: dict,
-                                      cookies, page_title: str) -> ExtractResult:
+                                      session, page_title: str) -> ExtractResult:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
         captured = {"m3u8": None, "title": page_title}
@@ -420,6 +446,8 @@ class PixellotExtractor(BaseExtractor):
                 elif captured["m3u8"] is None:
                     captured["m3u8"] = req_url
 
+        is_storage_state = isinstance(session, dict) and "origins" in session and "cookies" in session
+
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
@@ -429,22 +457,30 @@ class PixellotExtractor(BaseExtractor):
                     "--disable-dev-shm-usage",
                 ],
             )
-            context = browser.new_context(
-                user_agent=headers.get("User-Agent", ""),
-                viewport={"width": 1280, "height": 800},
-            )
+            context_kwargs = {
+                "user_agent": headers.get("User-Agent", ""),
+                "viewport": {"width": 1280, "height": 800},
+            }
+            if is_storage_state:
+                # This is the path that actually authenticates the SPA —
+                # Pixellot's Firebase Auth session lives in a localStorage
+                # key, not a cookie, so it has to be loaded via storage_state
+                # rather than context.add_cookies(). Confirmed live: a
+                # cookies-only context on this same page never fires the
+                # m3u8 request; a storage_state context does immediately.
+                context_kwargs["storage_state"] = session
+            context = browser.new_context(**context_kwargs)
             context.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
             )
 
-            # Attach existing cookies if the caller provided them. Pixellot's
-            # session cookies were observed to come from you.pixellot.tv
-            # specifically (a Nuxt app), which may or may not be scoped to
-            # the parent .pixellot.tv domain — set for both so it lands
-            # regardless of how strictly the original cookie was scoped.
-            if isinstance(cookies, dict):
+            # Legacy path: caller passed a flat cookie dict instead of a
+            # storage_state (e.g. a stale on-disk cache from before this
+            # fix). Attach what we have — it won't authenticate the SPA
+            # (see above) but doesn't hurt for public/unauthenticated pages.
+            if not is_storage_state and isinstance(session, dict):
                 pw_cookies = []
-                for name, value in cookies.items():
+                for name, value in session.items():
                     pw_cookies.append({
                         "name": name, "value": value,
                         "domain": "you.pixellot.tv", "path": "/",
@@ -464,22 +500,37 @@ class PixellotExtractor(BaseExtractor):
 
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=20000)
+
+                def _try_click_play():
+                    try:
+                        play_btn = page.locator(
+                            'button[aria-label*="play" i], .vjs-big-play-button, '
+                            '.play-button, button.play'
+                        ).first
+                        if play_btn.is_visible(timeout=3000):
+                            play_btn.click()
+                    except Exception:
+                        pass
+
                 # Trigger video player initialisation by clicking the play
                 # button if it's visible, then wait for the m3u8 request.
-                try:
-                    play_btn = page.locator(
-                        'button[aria-label*="play" i], .vjs-big-play-button, '
-                        '.play-button, button.play'
-                    ).first
-                    if play_btn.is_visible(timeout=3000):
-                        play_btn.click()
-                except Exception:
-                    pass
+                _try_click_play()
 
-                # Wait up to 20s for the player to fetch its m3u8
-                deadline = time.time() + 20
+                # Share links (.link) land on a Branch.io interstitial first;
+                # its desktop-web redirect chain (interstitial -> share page
+                # with token -> real event view) is JS-driven and needs real
+                # time to complete + the destination SPA to hydrate before a
+                # play button even exists. Confirmed live: ~20-35s end to end.
+                # Give it a generous window and retry the click once partway
+                # through, since the button that mattered wasn't on the page
+                # at t=0.
+                deadline = time.time() + 35
+                clicked_again = False
                 while captured["m3u8"] is None and time.time() < deadline:
                     time.sleep(0.3)
+                    if not clicked_again and time.time() > deadline - 20:
+                        clicked_again = True
+                        _try_click_play()
 
                 # Grab the page title if we didn't have one yet
                 if not captured["title"]:
@@ -509,33 +560,6 @@ class PixellotExtractor(BaseExtractor):
             headers=stream_headers,
             base_url=m3u8_url.rsplit("/", 1)[0] + "/",
         )
-
-    def _parse_pixellot_event(self, data: dict, source_url: str, headers: dict) -> ExtractResult:
-        title = data.get("title") or data.get("name") or "pixellot_game"
-        streams = data.get("streams") or data.get("hlsUrl") or []
-
-        if isinstance(streams, str):
-            # Single m3u8 URL
-            return ExtractResult(
-                title=_clean_title(title),
-                platform=self.PLATFORM,
-                m3u8_url=streams,
-                headers=headers,
-                base_url=streams.rsplit("/", 1)[0] + "/",
-            )
-
-        for stream in (streams if isinstance(streams, list) else []):
-            stream_url = stream.get("url") or stream.get("hls") or ""
-            if ".m3u8" in stream_url:
-                return ExtractResult(
-                    title=_clean_title(title),
-                    platform=self.PLATFORM,
-                    m3u8_url=stream_url,
-                    headers=headers,
-                    base_url=stream_url.rsplit("/", 1)[0] + "/",
-                )
-
-        raise ExtractionError("No HLS stream found in PIXELLOT API response")
 
 
 def _clean_title(title: str) -> str:
