@@ -412,6 +412,15 @@ class HudlExtractor(BaseExtractor):
             if res and not res.team_name:
                 res.team_name = team_name
             return res
+        except AuthRequiredError:
+            # A real, specific signal (e.g. HUDL's own "you don't have access
+            # to this team" page) -- let it propagate as-is rather than
+            # burying it in the generic message below. Confirmed live: this
+            # is a distinct failure mode from stream-resolution issues, and
+            # reporting it as a manifest bug sends the caller chasing a code
+            # fix for what's actually an account-permissions problem on
+            # HUDL's side.
+            raise
         except Exception as e:
             # Login succeeded (we have cookies) but neither the GraphQL API nor
             # the player exposed a stream URL. Be honest about which stage
@@ -523,6 +532,28 @@ class HudlExtractor(BaseExtractor):
                           wait_until="domcontentloaded", timeout=15000)
                 page.goto(url, wait_until="domcontentloaded", timeout=20000)
                 captured["title"] = page.title()
+
+                # Distinguish "no manifest found" from "HUDL denied access to
+                # this team/video for this account" -- the latter is a real,
+                # separate failure mode confirmed live (an account that had
+                # lost/never had team access got exactly this page instead of
+                # a player), and reporting it as a generic manifest-not-found
+                # sends the caller looking for a code bug that isn't there.
+                try:
+                    body_text = page.locator("body").inner_text(timeout=2000).lower()
+                    if "don't have access to this team" in body_text or "permissions may have changed" in body_text:
+                        raise AuthRequiredError(
+                            "HUDL",
+                            "HUDL says this account does not have access to this "
+                            "team/video (page text: \"You don't have access to "
+                            "this team\"). This is not a manifest-detection bug -- "
+                            "the logged-in account's HUDL permissions for this "
+                            "team need to be checked/restored on HUDL's side."
+                        )
+                except AuthRequiredError:
+                    raise
+                except Exception:
+                    pass
 
                 # The player does NOT request its manifest until playback is
                 # triggered, so just loading the page leaves no .m3u8 to catch
