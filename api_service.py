@@ -52,6 +52,23 @@ MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "3"))
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", tempfile.mkdtemp(prefix="sreelz_"))
 NORMALIZE_VIDEO = os.environ.get("NORMALIZE_VIDEO", "true").lower() == "true"
 
+# Ceiling for the normalization re-encode. This used to be a flat 30 minutes,
+# which silently broke full-length games: a 108-minute 1080p match (a real,
+# common case for HUDL/VEO team footage) cannot finish an x264 re-encode in
+# 30 minutes, especially with MAX_WORKERS jobs re-encoding concurrently on a
+# shared container CPU. The encode was killed every time, so normalization
+# silently never happened on exactly the long game videos it mattered for.
+# Now the budget scales with the source duration (see _normalize_video), with
+# an absolute ceiling so a pathological input still can't wedge a worker.
+# 120s of budget per minute of source. Deliberately generous: x264 preset=fast
+# at 1080p runs near real time on a dedicated core, but MAX_WORKERS jobs
+# normalize concurrently and each then gets a fraction of the CPU, so the
+# per-job wall-clock cost scales with how many run at once. Overshooting here
+# costs nothing when the encode finishes early (subprocess.run returns as soon
+# as ffmpeg exits); undershooting silently drops normalization.
+NORMALIZE_TIMEOUT_PER_MIN = float(os.environ.get("NORMALIZE_TIMEOUT_PER_MIN", "120"))
+NORMALIZE_TIMEOUT_MAX = float(os.environ.get("NORMALIZE_TIMEOUT_MAX", "14400"))  # 4h
+
 # Direct S3 upload — when S3_BUCKET is configured, the downloaded video is
 # uploaded straight to the bucket and download_url is set to the resulting
 # (presigned) S3 URL. If only SPORTSREELZ_UPLOAD_URL is configured, the
@@ -316,11 +333,7 @@ async def health():
     }
 
 
-@app.post(
-    "/api/trace/clear-session",
-    tags=["Trace"],
-    summary="Clear cached Trace session",
-)
+@app.post("/api/trace/clear-session")
 async def clear_trace_session(req: ClearTraceSessionRequest):
     """Clear a cached Trace session so the magic-code flow runs fresh on the
     next import. Trace sessions are cached for 30 days; this lets you re-test
@@ -827,10 +840,38 @@ def _process_job(job_id: str, cookies: dict = None, session_token: str = None):
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
+def _probe_duration_seconds(path: str):
+    """Source duration via ffprobe. Returns None if it can't be determined —
+    callers must treat None as 'unknown' rather than assuming a short clip."""
+    import subprocess
+
+    probe = (os.path.join(os.path.dirname(ffmpeg_path), "ffprobe")
+             if os.path.dirname(ffmpeg_path) else "ffprobe")
+    try:
+        r = subprocess.run(
+            [probe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return float(r.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
 def _normalize_video(input_path: str, output_path: str) -> bool:
     """
     Re-encode video to 1080p 16:9 standard format.
     Ensures consistent output for the SPORTSREELZ platform.
+
+    The timeout scales with the source length instead of using a flat cap.
+    A full match runs ~108 minutes; under the old flat 30-minute limit that
+    encode was always killed mid-way, so normalization silently never
+    applied to full game footage (the job still succeeded — the fallback
+    just ships the un-normalized original — which is why this failed
+    quietly instead of surfacing as an error).
     """
     import subprocess
 
@@ -845,13 +886,41 @@ def _normalize_video(input_path: str, output_path: str) -> bool:
         output_path,
     ]
 
+    duration_s = _probe_duration_seconds(input_path)
+    if duration_s and duration_s > 0:
+        timeout_s = min(
+            NORMALIZE_TIMEOUT_MAX,
+            max(1800.0, (duration_s / 60.0) * NORMALIZE_TIMEOUT_PER_MIN),
+        )
+    else:
+        # Duration unknown — don't gamble on the old 30-minute guess, which
+        # is the exact value that silently broke long games.
+        timeout_s = NORMALIZE_TIMEOUT_MAX
+
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=1800,  # 30 min max
+            cmd, capture_output=True, text=True, timeout=timeout_s,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        if result.returncode != 0:
+            log.warning(
+                f"Normalization ffmpeg exited {result.returncode}: "
+                f"{(result.stderr or '')[-400:]}"
+            )
         return result.returncode == 0
-    except Exception:
+    except subprocess.TimeoutExpired:
+        # Previously indistinguishable from any other failure. Say so plainly
+        # so a too-tight budget is diagnosable from the logs instead of just
+        # looking like "normalization failed, using original".
+        log.warning(
+            f"Normalization timed out after {timeout_s:.0f}s for a "
+            f"{(duration_s or 0)/60:.0f} min source — shipping the "
+            f"un-normalized original. Raise NORMALIZE_TIMEOUT_PER_MIN if this "
+            f"recurs on legitimately long footage."
+        )
+        return False
+    except Exception as e:
+        log.warning(f"Normalization failed: {type(e).__name__}: {e}")
         return False
 
 
