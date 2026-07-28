@@ -10,12 +10,35 @@ User provides email + password once. This module:
 import os
 import json
 import time
+import hashlib
 from pathlib import Path
 from http.cookiejar import MozillaCookieJar
 
 HUDL_DIR = Path.home() / ".hudl"
 COOKIES_FILE = HUDL_DIR / "cookies.txt"
 CREDS_FILE = HUDL_DIR / "credentials.json"
+
+
+def cookies_file_for(email: str) -> Path:
+    """Per-account cookie jar path.
+
+    This module originally kept ONE shared cookies.txt for every login. That
+    is fine for a single-user desktop app but silently wrong for an API
+    serving multiple HUDL accounts: ensure_valid_cookies() only asked "is
+    there a valid session on disk?", never "does that session belong to the
+    account being requested?" — so a session cached from account A was handed
+    back for a request authenticating as account B. The extractor then opened
+    B's team using A's session and HUDL answered "You don't have access to
+    this team", which reads exactly like a permissions problem on the team
+    rather than the account mix-up it actually is.
+
+    Keying the jar by account also stops concurrent jobs for different
+    accounts from overwriting each other's session in a single file.
+    """
+    if not email:
+        return COOKIES_FILE
+    digest = hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()[:16]
+    return HUDL_DIR / f"cookies_{digest}.txt"
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -44,24 +67,30 @@ def load_credentials() -> tuple:
 
 # ── Cookie validation (local only, zero HTTP calls) ───────────────────────────
 
-def are_cookies_valid(full_check: bool = False) -> bool:
+def are_cookies_valid(full_check: bool = False, cookies_file=None) -> bool:
     """
     Check if saved HUDL cookies are still usable.
 
+    cookies_file: which jar to check. Defaults to the legacy shared
+      cookies.txt; callers authenticating a specific account must pass that
+      account's jar (see cookies_file_for) so a different account's live
+      session is never mistaken for this one's.
+
     fast path (default, full_check=False):
-      - Reads cookies.txt locally, checks 'ident' cookie exists and hasn't expired.
+      - Reads the jar locally, checks 'ident' cookie exists and hasn't expired.
       - Takes <1ms, no network.
 
     full_check=True:
       - Also makes one HTTP call to HUDL GraphQL to confirm the session is live.
       - Used by the 'Test Login' button only.
     """
-    if not COOKIES_FILE.exists():
+    cookies_file = Path(cookies_file) if cookies_file else COOKIES_FILE
+    if not cookies_file.exists():
         return False
 
     try:
         jar = MozillaCookieJar()
-        jar.load(str(COOKIES_FILE), ignore_discard=True, ignore_expires=True)
+        jar.load(str(cookies_file), ignore_discard=True, ignore_expires=True)
 
         ident_found = False
         for cookie in jar:
@@ -99,11 +128,16 @@ def are_cookies_valid(full_check: bool = False) -> bool:
 
 # ── Browser login ─────────────────────────────────────────────────────────────
 
-def login_with_browser(email: str, password: str, on_status=None) -> bool:
+def login_with_browser(email: str, password: str, on_status=None,
+                       cookies_file=None) -> bool:
     """
     Log in to HUDL via browser and save session cookies.
     Tries headless (invisible) first — no window shown to user.
     Falls back to visible window only if headless is blocked by HUDL.
+
+    cookies_file: where to write the resulting jar. Defaults to the legacy
+      shared cookies.txt; API callers pass the per-account path so accounts
+      don't overwrite one another.
     """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -125,7 +159,7 @@ def login_with_browser(email: str, password: str, on_status=None) -> bool:
 
         try:
             _do_browser_login(email, password, headless=headless,
-                              on_status=on_status)
+                              on_status=on_status, cookies_file=cookies_file)
             return True
         except RuntimeError as e:
             last_error = e
@@ -137,7 +171,7 @@ def login_with_browser(email: str, password: str, on_status=None) -> bool:
 
 
 def _do_browser_login(email: str, password: str, headless: bool,
-                      on_status=None):
+                      on_status=None, cookies_file=None):
     """Inner login — runs Playwright with given headless setting.
 
     Dispatched to a fresh worker thread via run_playwright_sync because the
@@ -145,11 +179,12 @@ def _do_browser_login(email: str, password: str, headless: bool,
     handler context).
     """
     from extractors.base import run_playwright_sync
-    return run_playwright_sync(_do_browser_login_sync, email, password, headless, on_status, timeout=120)
+    return run_playwright_sync(_do_browser_login_sync, email, password,
+                               headless, on_status, cookies_file, timeout=120)
 
 
 def _do_browser_login_sync(email: str, password: str, headless: bool,
-                           on_status=None):
+                           on_status=None, cookies_file=None):
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
     # Anti-detection args for headless mode
@@ -213,7 +248,7 @@ def _do_browser_login_sync(email: str, password: str, headless: bool,
             if on_status:
                 on_status("Login successful, saving cookies...")
 
-            _save_cookies_netscape(context.cookies())
+            _save_cookies_netscape(context.cookies(), cookies_file)
             browser.close()
 
         except PWTimeout:
@@ -228,7 +263,7 @@ def _do_browser_login_sync(email: str, password: str, headless: bool,
             raise RuntimeError(f"HUDL login failed: {e}")
 
 
-def _save_cookies_netscape(cookies: list):
+def _save_cookies_netscape(cookies: list, cookies_file=None):
     lines = ["# Netscape HTTP Cookie File\n"]
     for c in cookies:
         domain = c.get("domain", "")
@@ -243,7 +278,9 @@ def _save_cookies_netscape(cookies: list):
             f"{domain}\t{flag}\t{c.get('path','/')}\t{secure}\t"
             f"{expires}\t{c.get('name','')}\t{c.get('value','')}\n"
         )
-    with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+    target = Path(cookies_file) if cookies_file else COOKIES_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
         f.writelines(lines)
 
 
@@ -251,14 +288,27 @@ def _save_cookies_netscape(cookies: list):
 
 def ensure_valid_cookies(email: str, password: str, on_status=None) -> str:
     """
-    Ensure HUDL session cookies are valid.
+    Ensure HUDL session cookies are valid FOR THIS ACCOUNT.
+
+    The reuse check is scoped to the requested account's own jar. It used to
+    check a single shared cookies.txt and return early whenever any live
+    session existed, without regard to whose it was — so on a server that had
+    previously authenticated a different HUDL account, this returned that
+    other account's session and never logged in as `email` at all. The
+    extractor then hit the requested team with the wrong identity and HUDL
+    replied "You don't have access to this team", which looks like a team
+    permissions problem and is not.
+
     Uses local-only cookie check (no HTTP) — instant on every download start.
-    Only triggers browser login when cookies are actually expired.
+    Only triggers browser login when this account's cookies are missing or
+    expired.
     """
-    if are_cookies_valid(full_check=False):
+    cookies_file = cookies_file_for(email)
+
+    if are_cookies_valid(full_check=False, cookies_file=cookies_file):
         if on_status:
             on_status("HUDL: session active")
-        return str(COOKIES_FILE)
+        return str(cookies_file)
 
     if not email or not password:
         raise ValueError(
@@ -266,11 +316,12 @@ def ensure_valid_cookies(email: str, password: str, on_status=None) -> str:
             "Enter your HUDL email and password in the settings."
         )
 
-    login_with_browser(email, password, on_status=on_status)
+    login_with_browser(email, password, on_status=on_status,
+                       cookies_file=cookies_file)
     save_credentials(email, password)
 
     # After login, do a full HTTP check to confirm cookies actually work
-    if not are_cookies_valid(full_check=True):
+    if not are_cookies_valid(full_check=True, cookies_file=cookies_file):
         raise RuntimeError(
             "Login appeared to succeed but session validation failed.\n"
             "Please check your credentials and try again."
@@ -279,7 +330,7 @@ def ensure_valid_cookies(email: str, password: str, on_status=None) -> str:
     if on_status:
         on_status("HUDL: logged in and session saved")
 
-    return str(COOKIES_FILE)
+    return str(cookies_file)
 
 
 def needs_hudl_auth(urls: list) -> bool:
