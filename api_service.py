@@ -40,7 +40,7 @@ except ImportError:
 from extractors import extract, get_platform
 from extractors.base import ExtractionError, AuthRequiredError, detect_platform
 from extractors.trace import TraceAuthManager
-from downloader import HudlDownloader, DownloadProgress
+from downloader import HudlDownloader, DownloadProgress, download_clips, _redact_sensitive
 from quality import fetch_and_select
 from utils import find_ffmpeg, sanitize_filename
 
@@ -94,7 +94,14 @@ log = logging.getLogger("api_service")
 
 app = FastAPI(
     title="SPORTSREELZ Video Import Service",
-    description="Download videos from HUDL/VEO/Trace and upload to SPORTSREELZ",
+    description=(
+        "Download videos from HUDL/VEO/Trace/YouTube/Pixellot and upload to SPORTSREELZ.\n\n"
+        "**HUDL note:** Game film, per-play cutups, and online video editor links "
+        "(`https://www.hudl.com/online-video-editor/<team>/<id>/`) are supported. "
+        "For cutups (numeric `v=` / video id), paste the **full browser URL** that "
+        "includes `/team/<number>/` — the team id is required to resolve clip playlists. "
+        "Use the same HUDL login that can play the link on hudl.com."
+    ),
     version="1.0.0",
 )
 
@@ -276,12 +283,40 @@ async def auth_middleware(request: Request, call_next):
 # ── Models ────────────────────────────────────────────────────────────────────
 
 class ImportRequest(BaseModel):
-    user_id: str = Field(..., description="SPORTSREELZ user ID")
-    video_url: str = Field(..., description="Video URL from HUDL/VEO/Trace")
-    platform: Optional[str] = Field(None, description="Platform (auto-detected if omitted)")
-    platform_email: Optional[str] = Field(None, description="Platform login email")
-    platform_password: Optional[str] = Field(None, description="Platform login password")
-    quality: str = Field("1080p", description="Video quality: 1080p, 720p, best")
+    user_id: str = Field(..., description="SPORTSREELZ user ID", examples=["player_123"])
+    video_url: str = Field(
+        ...,
+        description=(
+            "Video URL from HUDL, VEO, Trace, YouTube, or Pixellot. "
+            "For HUDL cutups (numeric video id), use the full browser address bar "
+            "URL that contains `/team/<number>/` — without the team id the import fails."
+        ),
+        examples=[
+            "https://www.hudl.com/video/3/15987654/62e3a6b0",
+            "https://app.hudl.com/watch/team/14016/analyze?v=96200832&team=14016",
+            "https://www.hudl.com/online-video-editor/882621/100614148/",
+        ],
+    )
+    platform: Optional[str] = Field(
+        None,
+        description="Platform override: hudl, veo, trace, youtube, pixellot (auto-detected if omitted)",
+        examples=["hudl"],
+    )
+    platform_email: Optional[str] = Field(
+        None,
+        description="Platform login email (required for HUDL login and Trace magic code)",
+        examples=["player@email.com"],
+    )
+    platform_password: Optional[str] = Field(
+        None,
+        description="Platform login password (required for HUDL; for VEO may be a bearer token)",
+    )
+    quality: str = Field(
+        "1080p",
+        description="Preferred quality for HLS sources: 1080p, 720p, best. "
+                    "HUDL cutups always join the highest available per-play MP4.",
+        examples=["1080p"],
+    )
 
 
 class VerifyRequest(BaseModel):
@@ -296,19 +331,32 @@ class ImportResponse(BaseModel):
 
 
 class StatusResponse(BaseModel):
-    job_id: str
-    status: str
+    job_id: str = Field(..., description="Import job id from POST /api/import")
+    status: str = Field(
+        ...,
+        description=(
+            "Job status: queued, pending_verification, extracting, downloading, "
+            "processing, uploading, done, error. HUDL cutups stay in "
+            "`downloading` while per-play clips are fetched and joined."
+        ),
+    )
     platform: str
-    title: Optional[str] = None
+    title: Optional[str] = Field(None, description="Resolved video/game title when known")
     # Best-effort match metadata parsed from the title/platform. Null when the
     # source doesn't expose it (e.g. an arbitrary YouTube title with no opponent).
-    team_name: Optional[str] = None
-    opponent_name: Optional[str] = None
-    game_date: Optional[str] = None
-    percent: float = 0.0
-    speed: Optional[str] = None
-    error: Optional[str] = None
-    download_url: Optional[str] = None
+    team_name: Optional[str] = Field(
+        None,
+        description="Owning team/school when known (HUDL team lookup preferred over title parse)",
+    )
+    opponent_name: Optional[str] = Field(
+        None,
+        description="Opponent name when parseable from the title (HUDL owner-side corrected)",
+    )
+    game_date: Optional[str] = Field(None, description="Game date when parseable from the title")
+    percent: float = Field(0.0, description="Progress 0–100 while downloading/processing")
+    speed: Optional[str] = Field(None, description="Current download speed when available")
+    error: Optional[str] = Field(None, description="Human-readable error when status is error")
+    download_url: Optional[str] = Field(None, description="S3/download URL when status is done")
     created_at: float
     updated_at: float
 
@@ -365,8 +413,15 @@ async def clear_trace_session(req: ClearTraceSessionRequest):
 async def start_import(req: ImportRequest):
     """
     Start a video import job.
-    For Trace: returns status='pending_verification' — follow up with /api/import/verify.
-    For HUDL/VEO: starts download immediately.
+
+    - **Trace:** returns `pending_verification` — follow up with `/api/import/verify`.
+    - **HUDL / VEO / YouTube / Pixellot:** starts download immediately.
+
+    **HUDL cutups / editor links:** numeric video ids and
+    `/online-video-editor/<team>/<id>/` URLs are per-play cutups (no HLS).
+    Paste the full browser URL (team id included), plus the HUDL login that
+    can open that link on hudl.com. The importer lists each play's MP4, joins
+    them in order, then continues the normal normalize/upload flow.
     """
     job_id = str(uuid.uuid4())[:8]
     platform = req.platform or detect_platform(req.video_url)
@@ -605,6 +660,15 @@ def _process_job(job_id: str, cookies: dict = None, session_token: str = None):
         job["updated_at"] = time.time()
         log.error(f"[{job_id}] Extraction failed: {e}")
         return
+    except Exception as e:
+        # Anything else must still end the job: uncaught here, it left the job
+        # at "extracting" for good and the caller polled forever.
+        detail = _redact_sensitive(f"{type(e).__name__}: {e}")[:300]
+        job["status"] = "error"
+        job["error"] = f"Extraction failed: {detail}"
+        job["updated_at"] = time.time()
+        log.error(f"[{job_id}] Unexpected extraction error: {detail}")
+        return
 
     job["title"] = result.title
     team, opponent, game_date = _parse_match_meta(result.title, result.platform, result)
@@ -612,7 +676,9 @@ def _process_job(job_id: str, cookies: dict = None, session_token: str = None):
     # team API) over the best-effort title parse — it's correct even for
     # "@ Opponent" away-game titles where the home team isn't in the title.
     job["team_name"] = getattr(result, "team_name", None) or team
-    job["opponent_name"] = opponent
+    job["opponent_name"] = _opponent_not_owner(
+        getattr(result, "team_name", None), team, opponent
+    )
     job["game_date"] = game_date
     log.info(f"[{job_id}] Extracted: {result.title} ({result.platform})")
 
@@ -652,6 +718,12 @@ def _process_job(job_id: str, cookies: dict = None, session_token: str = None):
             progress = dl.download(
                 selected_url, output_path, result.headers, _on_progress,
             )
+        elif result.clip_urls:
+            log.info(f"[{job_id}] Joining {len(result.clip_urls)} clips")
+            progress = download_clips(
+                result.clip_urls, output_path, result.headers, _on_progress,
+                ffmpeg_path=ffmpeg_path,
+            )
         else:
             job["status"] = "error"
             job["error"] = "No downloadable URL found"
@@ -674,6 +746,10 @@ def _process_job(job_id: str, cookies: dict = None, session_token: str = None):
 
     file_size = os.path.getsize(output_path)
     log.info(f"[{job_id}] Downloaded: {file_size / 1024 / 1024:.1f} MB")
+    if result.clip_urls:
+        # HUDL's per-clip durations overstate the footage (~0.16 s a play,
+        # 1557 s listed for a 1540 s game); report what was actually joined.
+        result.duration = _probe_duration_seconds(output_path) or result.duration
 
     # ── Normalize to 1080p 16:9 ───────────────────────────────────────
     if NORMALIZE_VIDEO:
@@ -994,6 +1070,36 @@ def _parse_match_meta(title, platform, result):
         opponent = parts[1].strip(" -–—|") or None
 
     return team, opponent, game_date
+
+
+_OWNER_SKIP_WORDS = {
+    "the", "st", "saint", "north", "south", "east", "west", "new", "mount",
+    "mt", "fort", "lake", "high", "school", "academy", "fc", "sc", "club",
+}
+
+
+def _opponent_not_owner(owner, team, opponent):
+    """The title's "A vs B" can list the owning team on either side. HUDL
+    titles on Strasburg's own account read "LHS vs. Strasburg High School",
+    so the parse puts Strasburg in the opponent slot. When the extractor named
+    the owner and the opponent side starts with the owner's name, return the
+    other side. Starts-with, not contains: "South Hills" is not "North Hills"."""
+    if not owner or not team or not opponent:
+        return opponent
+
+    def words(s):
+        return [w for w in re.split(r"[^A-Za-z0-9]+", s.lower()) if w]
+
+    # The owner's leading words up to its first real name word, so "North
+    # Hills" and "St. Mary's" match as wholes rather than on "hills"/"mary".
+    ow = words(owner)
+    n = next((i for i, w in enumerate(ow) if len(w) >= 3 and w not in _OWNER_SKIP_WORDS), None)
+    if n is None:
+        return opponent
+    key = ow[:n + 1]
+    if words(opponent)[:n + 1] == key and words(team)[:n + 1] != key:
+        return team
+    return opponent
 
 
 def _parse_cookies_file(path: str) -> dict:

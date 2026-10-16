@@ -138,6 +138,22 @@ Trace       traceup.com, tracevision.com    Email + magic code (2-step)
 YouTube     youtube.com, youtu.be           None (public)
 Pixellot    pixellot.tv                     None
 
+HUDL URL NOTES
+--------------
+- Standard game film (HLS): usual /video/... or /watch/... links work as before.
+- Cutups (per-play MP4 playlists, numeric video id): paste the FULL browser URL
+  that includes /team/<number>/ (and usually ?v=<digits>). Without the team
+  number the import cannot resolve the clip list.
+- Online video editor links are also supported:
+    https://www.hudl.com/online-video-editor/<team>/<id>/
+- Example team cutup URL:
+    https://app.hudl.com/watch/team/14016/analyze?v=96200832&team=14016
+- Use the same HUDL account that can play the link on hudl.com (NotFound on
+  the clip list usually means the wrong login or a stale saved session).
+- During cutup downloads, status stays "downloading" while clips are fetched
+  and joined; then the normal processing/upload steps run.
+- Leave out videos that do not play on hudl.com (e.g. 97092788).
+
 
 S3 UPLOAD PATTERN
 =================
@@ -181,7 +197,8 @@ All errors include an "error" field with a human-readable message.
 NOTES
 =====
 - The /docs endpoint provides full interactive Swagger documentation
-  where your team can test API calls directly in the browser.
+  where your team can test API calls directly in the browser (includes
+  HUDL cutup URL guidance on ImportRequest.video_url).
 - Trace sessions are cached for 30 days — players won't need to
   re-enter the magic code every time.
 - Video normalization (1080p, 16:9) is enabled by default.
