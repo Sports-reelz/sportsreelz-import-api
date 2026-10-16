@@ -25,6 +25,8 @@ DEFAULT_HEADERS = {
     "Origin": "https://www.hudl.com",
 }
 
+_EDITOR_PATH_RE = re.compile(r"^/online-video-editor/(\d+)/(\d+)/?$")
+
 GRAPHQL_ENDPOINT = "https://www.hudl.com/api/public/graphql/query"
 GRAPHQL_QUERY = (
     "query GetBroadcast($bid: ID) {"
@@ -78,6 +80,8 @@ class HudlExtractor(BaseExtractor):
         # app.hudl.com/watch and www.hudl.com/video are both authenticated URLs
         # that require login credentials. Treat them the same.
         auth_hosts = ("app.hudl.com", "www.hudl.com", "hudl.com")
+        if host in auth_hosts and _EDITOR_PATH_RE.search(parsed.path):
+            return "app_hudl"
         if host in auth_hosts and re.search(r'/(watch|video)/', parsed.path):
             return "app_hudl"
         if "hudl.com" in host:
@@ -284,6 +288,11 @@ class HudlExtractor(BaseExtractor):
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
         video_b64_raw = params.get("v", [None])[0]
+        # HUDL's video editor opens the same cutups at
+        # www.hudl.com/online-video-editor/<team>/<cutup>/ (seen live 13 Oct 2026).
+        m_editor = _EDITOR_PATH_RE.search(parsed.path)
+        if not video_b64_raw and m_editor:
+            video_b64_raw = m_editor.group(2)
         if not video_b64_raw:
             raise ExtractionError(f"No ?v= parameter found in URL: {url}")
 
@@ -316,10 +325,23 @@ class HudlExtractor(BaseExtractor):
         # just "@ Opponent", so the home team isn't in the title — this lookup
         # fills it in. Best-effort; never fatal to the extraction.
         team_id = None
-        m_team = re.search(r"[?&]team=(\d+)", url) or re.search(r"/team/(\d+)", url)
+        m_team = re.search(r"[?&]team=(\d+)", url) or re.search(r"/team/(\d+)", url) or m_editor
         if m_team:
             team_id = m_team.group(1)
         team_name = self._fetch_team_name(session, team_id, gql_headers) if team_id else None
+
+        # A numeric ?v= is a cutup: HUDL's per-play playlist, served as one MP4
+        # per play with no HLS manifest anywhere (confirmed live 11 Oct 2026),
+        # so neither the GraphQL video query nor the m3u8 fallback can find it.
+        # Base64 'Video<hex>' ids are never all digits and keep the old path.
+        if re.fullmatch(r"[0-9]+", video_id):
+            if not team_id:
+                raise ExtractionError(
+                    "This HUDL link is missing its team number, which HUDL needs "
+                    "to find the video. Copy the full link from the browser "
+                    "address bar (it contains /team/<number>/)."
+                )
+            return self._extract_cutup(session, team_id, video_id, headers, team_name)
 
         # Query HUDL GraphQL for playbackUrl
         # Try GraphQL queries from most to least fields.
@@ -434,6 +456,106 @@ class HudlExtractor(BaseExtractor):
                 "access to this specific video. Paste the exact app.hudl.com URL "
                 f"and we'll add support. (detail: {e})"
             )
+
+    def _extract_cutup(self, session, team_id: str, cutup_id: str,
+                       headers: dict, team_name) -> ExtractResult:
+        """Resolve a HUDL cutup to its ordered per-play clip URLs.
+
+        GET  .../team/<id>/cutup/<v>/clips  -> clipsWithTags, already in play
+             order (matches the 'PLAY #' tag and mediaTime on every cutup
+             checked). Each clip has one file per quality.
+        PUT  .../team/<id>/cutups/getCutups -> the cutup's name (POST is 405).
+        The clip MP4s themselves download without cookies.
+        """
+        base = f"https://www.hudl.com/api/v2/classicfacade/team/{team_id}"
+        api_headers = {
+            **headers,
+            "Accept": "application/json",
+            "Referer": "https://app.hudl.com/",
+            "Origin": "https://app.hudl.com",
+        }
+        try:
+            resp = session.get(f"{base}/cutup/{cutup_id}/clips",
+                               headers=api_headers, timeout=20)
+        except requests.RequestException as e:
+            raise ExtractionError(f"Could not reach HUDL to list the clips of video {cutup_id}: {e}")
+        if resp.status_code in (401, 403):
+            raise AuthRequiredError(
+                "HUDL",
+                f"The HUDL account does not have access to video {cutup_id} "
+                f"(HTTP {resp.status_code}).",
+            )
+        if resp.status_code == 404:
+            # Seen live on a real link: HUDL's own player showed "There was a
+            # problem loading your video" for the same account, so this is a
+            # HUDL-side state, not something the importer can work around.
+            raise ExtractionError(
+                f"HUDL has no playable video {cutup_id} for this account: its "
+                "clip list returns NotFound. Check the link plays on hudl.com "
+                "while signed in as the same account."
+            )
+        if resp.status_code != 200:
+            raise ExtractionError(
+                f"HUDL clip list for video {cutup_id} returned HTTP {resp.status_code}."
+            )
+        try:
+            body = resp.json()
+        except ValueError:
+            raise ExtractionError(f"HUDL clip list for video {cutup_id} was not JSON.")
+
+        urls, ticks, missing = [], 0, 0
+        try:
+            clips = body.get("clipsWithTags") or []
+            for clip in clips:
+                # Same camera on every play: lowest 'order' first. No
+                # multi-angle cutup has been seen yet; 'order' is assumed to
+                # be the angle's position (it is 0 on every single-angle clip).
+                angle = min(clip.get("angles") or [{}], key=lambda a: a.get("order") or 0)
+                files = [f for f in (angle.get("files") or [])
+                         if str(f.get("fileName") or "").startswith("https://")]
+                if not files:
+                    missing += 1
+                    continue
+                urls.append(max(files, key=lambda f: float(f.get("quality") or 0))["fileName"])
+                ticks += float(angle.get("duration") or 0)
+        except (AttributeError, TypeError, ValueError, KeyError) as e:
+            raise ExtractionError(
+                f"HUDL clip list for video {cutup_id} came back in an unexpected "
+                f"format ({type(e).__name__})."
+            )
+        if missing:
+            # A play with no file would leave a silent hole in the game video.
+            raise ExtractionError(
+                f"HUDL video {cutup_id}: {missing} of {len(clips)} plays have no "
+                "video file yet (HUDL may still be processing). Try again later."
+            )
+        if not urls:
+            raise ExtractionError(f"HUDL video {cutup_id} has no clips.")
+
+        title = None
+        try:
+            r = session.put(f"{base}/cutups/getCutups",
+                            json={"cutupIds": [str(cutup_id)]},
+                            headers={**api_headers, "Content-Type": "application/json"},
+                            timeout=15)
+            if r.status_code == 200:
+                rows = r.json()
+                if rows:
+                    title = rows[0].get("name")
+        except Exception:
+            pass
+        # Keep '/' in dates ("08/15/2026") so _parse_match_meta can read them;
+        # the download filename is sanitized separately.
+        title = re.sub(r"[\x00-\x1f]", "", title or "").strip()[:100] or f"hudl_video_{cutup_id}"
+
+        return ExtractResult(
+            title=title,
+            platform=self.PLATFORM,
+            clip_urls=urls,
+            headers={"User-Agent": headers.get("User-Agent", "Mozilla/5.0")},
+            duration=(ticks / 1e7) or None,
+            team_name=team_name,
+        )
 
     def _fetch_team_name(self, session, team_id: str, gql_headers: dict):
         """Resolve a HUDL numeric team id to a human-readable team/school name

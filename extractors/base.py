@@ -39,6 +39,7 @@ class ExtractResult:
     m3u8_url: Optional[str] = None          # HLS master playlist URL
     direct_url: Optional[str] = None        # Direct MP4/video URL (no ffmpeg needed for yt-dlp)
     use_ytdlp: bool = False                 # True = let yt-dlp handle the full download
+    clip_urls: list = field(default_factory=list)  # Ordered MP4 clips to download and join (HUDL cutups)
 
     # Source URL (for yt-dlp pass-through)
     source_url: Optional[str] = None
@@ -57,7 +58,7 @@ class ExtractResult:
     team_name: Optional[str] = None         # owning team/school (e.g. HUDL team lookup)
 
     def __repr__(self):
-        url = self.m3u8_url or self.direct_url or self.source_url or "?"
+        url = self.m3u8_url or self.direct_url or (self.clip_urls[0] if self.clip_urls else None) or self.source_url or "?"
         return f"ExtractResult(platform={self.platform!r}, title={self.title!r}, url={url[:60]}...)"
 
 

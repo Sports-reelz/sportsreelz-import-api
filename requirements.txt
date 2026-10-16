@@ -3,11 +3,22 @@ uvicorn[standard]>=0.27.0
 pydantic>=2.5.0
 python-dotenv>=1.0.0
 requests>=2.31.0
-yt-dlp>=2024.1.0
+yt-dlp>=2026.7.4
+# ^ bumped from 2024.1.0 (2026.7.4 confirmed current on PyPI) -- Docker caches
+# the pip-install layer keyed on this file's contents, so a stale floor
+# version here means `docker build` (without --no-cache) can keep reusing a
+# yt-dlp resolved a year+ ago even though the constraint technically allows
+# newer. YouTube's bot-detection/PO-token requirements change often enough
+# that this matters. Bumping the floor forces cache invalidation and pulls
+# current yt-dlp on next build.
 boto3>=1.34.0
 playwright>=1.40.0
 # yt-dlp plugin: generates Proof-of-Origin Tokens via a sidecar HTTP server,
 # which is the only reliable way past YouTube's 2026 datacenter-IP bot gate.
 # Inert when no BGUTIL_BASE_URL is configured, so safe to keep installed
 # whether or not the bgutil sidecar is actually running.
-bgutil-ytdlp-pot-provider>=0.5.0
+# Bumped floor 0.5.0 -> 1.3.1 (confirmed current on PyPI): that's a major
+# version jump, likely carrying real PO-token protocol updates to keep pace
+# with YouTube's own bot-detection changes -- same Docker-layer-caching
+# concern as the yt-dlp pin above applies here too.
+bgutil-ytdlp-pot-provider>=1.3.1
