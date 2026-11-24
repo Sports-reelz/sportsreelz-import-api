@@ -467,6 +467,10 @@ def download_single(url: str, output_dir: str, quality: str, ffmpeg_path: str,
         # YouTube, VEO, and other yt-dlp-native platforms
         cookies_path = cookies if isinstance(cookies, str) and os.path.isfile(cookies) else None
         progress = download_with_ytdlp(result, output_path, quality, cookies_path, _progress)
+    elif result.video_files:
+        # VEO: plain HTTPS download of the file the video list names
+        from extractors.veo import download_file
+        progress = download_file(result, output_path, quality, _progress)
     else:
         # HLS via FFmpeg (HUDL, PIXELLOT, TRACE)
         dl = HudlDownloader(ffmpeg_path)

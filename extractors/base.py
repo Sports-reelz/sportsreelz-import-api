@@ -44,6 +44,9 @@ class ExtractResult:
     # Source URL (for yt-dlp pass-through)
     source_url: Optional[str] = None
 
+    # Files a plain download can fetch (VEO): rows of VEO's video list, each with url, mime_type, height, ...
+    video_files: list = field(default_factory=list)
+
     # Quality variants (populated from m3u8 parsing)
     qualities: list = field(default_factory=list)
 
@@ -56,6 +59,7 @@ class ExtractResult:
     duration: Optional[float] = None        # seconds
     thumbnail: Optional[str] = None
     team_name: Optional[str] = None         # owning team/school (e.g. HUDL team lookup)
+    game_date: Optional[str] = None         # MM/DD/YYYY from the platform's own game record
 
     def __repr__(self):
         url = self.m3u8_url or self.direct_url or (self.clip_urls[0] if self.clip_urls else None) or self.source_url or "?"
