@@ -100,7 +100,9 @@ app = FastAPI(
         "(`https://www.hudl.com/online-video-editor/<team>/<id>/`) are supported. "
         "For cutups (numeric `v=` / video id), paste the **full browser URL** that "
         "includes `/team/<number>/` — the team id is required to resolve clip playlists. "
-        "Use the same HUDL login that can play the link on hudl.com."
+        "Use the same HUDL login that can play the link on hudl.com.\n\n"
+        "**VEO note:** Public matches only. The importer no longer uses "
+        "`platform_email` / `platform_password` for VEO; private matches will not import."
     ),
     version="1.0.0",
 )
@@ -309,7 +311,7 @@ class ImportRequest(BaseModel):
     )
     platform_password: Optional[str] = Field(
         None,
-        description="Platform login password (required for HUDL; for VEO may be a bearer token)",
+        description="Platform login password (required for HUDL). Not used for VEO — public matches only.",
     )
     quality: str = Field(
         "1080p",
@@ -505,13 +507,9 @@ async def start_import(req: ImportRequest):
             job_id=job_id, status="queued", message="Download started",
         )
 
-    # ── VEO: email + password or public ───────────────────────────────
+    # ── VEO: public matches only; the request's email/password are not used ──
     if platform == "veo":
-        session_token = None
-        if req.platform_password:
-            session_token = req.platform_password  # VEO uses bearer token as password
-
-        executor.submit(_process_job, job_id, session_token=session_token)
+        executor.submit(_process_job, job_id)
         return ImportResponse(
             job_id=job_id, status="queued", message="Download started",
         )
@@ -701,6 +699,11 @@ def _process_job(job_id: str, cookies: dict = None, session_token: str = None):
             progress = download_with_ytdlp(
                 result, output_path, quality,
                 progress_callback=_on_progress,
+            )
+        elif result.video_files:
+            from extractors.veo import download_file
+            progress = download_file(
+                result, output_path, quality, _on_progress,
             )
         elif result.m3u8_url:
             # Quality selection
